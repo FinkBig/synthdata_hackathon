@@ -10,6 +10,9 @@ import logging
 import os
 
 import uvicorn
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env if present (file is gitignored)
 
 logging.basicConfig(
     level=logging.INFO,
