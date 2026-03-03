@@ -9,15 +9,16 @@ Discrete Vertical Mapping (Finite Difference) Formula:
   For calls above spot:
     P(K1 < S_T < K2) = (C(K1).mid - C(K2).mid) / (K2 - K1)
 
-  For puts below spot:
-    P(K1 < S_T < K2) = (P(K2).mid - P(K1).mid) / (K2 - K1)
+  For puts below spot (direct CDF form):
+    (P(K2).mid - P(K1).mid) / (K2 - K1) ≈ dP/dK ≈ CDF(K1) = P(S_T < K1)
+    So: P(S_T > K1) = 1 - (P(K2).mid - P(K1).mid) / (K2 - K1)
 
   Building the full P(S > K) curve:
     1. Filter options to target expiry (nearest to 24h)
     2. Sort calls: K1 < K2 < ... < Kn (all above spot)
     3. range_prob[i] = (C(Ki).mid - C(Ki+1).mid) / (Ki+1 - Ki)
-    4. P(S > Ki) = sum(range_prob[j] for j >= i)
-    5. Repeat for puts below spot
+    4. P(S > Ki) = sum(range_prob[j] for j >= i)  [calls: accumulate down]
+    5. For puts: P(S > Ki) = 1 - (P(Ki+1) - P(Ki)) / dK  [direct, no accumulation]
     6. Stitch at spot: P(S > spot) ≈ 0.5
 """
 
@@ -207,6 +208,12 @@ def build_derive_prob_curve(
     iv1 = _atm_iv_for_expiry(options, exp1, spot) if exp1 else 0.0
     iv2 = _atm_iv_for_expiry(options, exp2, spot) if exp2 else 0.0
 
+    # BSM boundary TTE: use the primary chain's own expiry, not t_poly.
+    # When t_poly < t_primary (no option expires before Poly settlement), using t_poly
+    # gives a near-zero boundary while range probs encode the longer horizon —
+    # the accumulation overshoots 1.0 and zeroes out the entire above-spot curve.
+    primary_tte = t2 if (exp2 is not None and t2 > 0) else (t1 if t1 > 0 else t_poly)
+
     # If we have both brackets, use variance-interpolated IV to scale option prices
     # For the DVM, we use the option mid prices directly (no IV needed for spreads)
     # IV is only used to double-check the probability is reasonable
@@ -250,8 +257,8 @@ def build_derive_prob_curve(
                     iv_interp = interpolate_variance_to_poly(iv1, t1, iv2, t2, t_poly)
                     iv_last = iv_interp  # Use interpolated IV for boundary
                 import math as _math
-                if t_poly > 0 and iv_last > 0:
-                    d2 = (_math.log(spot / k_last) + (-0.5 * iv_last ** 2) * t_poly) / (iv_last * _math.sqrt(t_poly))
+                if primary_tte > 0 and iv_last > 0:
+                    d2 = (_math.log(spot / k_last) + (-0.5 * iv_last ** 2) * primary_tte) / (iv_last * _math.sqrt(primary_tte))
                     from scipy.stats import norm as _norm
                     p_above_last = float(_norm.cdf(d2))
                 else:
@@ -276,9 +283,8 @@ def build_derive_prob_curve(
                 prob_above[k_lo] = p_above_lo
 
     # --- Puts: P(S > K) from put spreads ---
-    # P(K_i < S < K_{i+1}) = (P(K_{i+1}).mid - P(K_i).mid) / (K_{i+1} - K_i)
-    # P(S < K_i) = sum of put range probs below K_i
-    # P(S > K_i) = 1 - P(S < K_i)
+    # dP/dK ≈ CDF(K) = P(S < K), so each consecutive pair gives P(S > K_lo) directly:
+    #   P(S > K_lo) = 1 - (P(K_hi).mid - P(K_lo).mid) / (K_hi - K_lo)
     if len(puts) >= 2:
         # Derive returns prices in USD/USDC directly
         put_mids = [(o.strike, _mid(o.bid, o.ask, o.mark_price)) for o in puts]
@@ -297,8 +303,8 @@ def build_derive_prob_curve(
                     iv_interp = interpolate_variance_to_poly(iv1, t1, iv2, t2, t_poly)
                     iv_first = iv_interp
                 import math as _math
-                if t_poly > 0 and iv_first > 0:
-                    d2 = (_math.log(spot / k_first) + (-0.5 * iv_first ** 2) * t_poly) / (iv_first * _math.sqrt(t_poly))
+                if primary_tte > 0 and iv_first > 0:
+                    d2 = (_math.log(spot / k_first) + (-0.5 * iv_first ** 2) * primary_tte) / (iv_first * _math.sqrt(primary_tte))
                     from scipy.stats import norm as _norm
                     p_below_first = float(_norm.cdf(-d2))
                 else:
@@ -310,19 +316,18 @@ def build_derive_prob_curve(
             p_above_first = 1.0 - p_below_first
             prob_above[k_first] = p_above_first
 
-            # Work forward
-            cumulative_below = p_below_first
+            # Work forward — direct DVM assignment
+            # Key insight: (P(K_hi) - P(K_lo)) / dK ≈ dP/dK ≈ CDF(K_lo) = P(S < K_lo)
+            # NOT a range probability. Accumulating CDF values overshoots 1.0 near ATM.
+            # Instead, each spread directly gives P(S > K_lo) = 1 - CDF(K_lo).
             for i in range(len(put_mids) - 1):
                 k_lo, m_lo = put_mids[i]
                 k_hi, m_hi = put_mids[i + 1]
                 dK = k_hi - k_lo
                 if dK <= 0:
                     continue
-                range_prob = (m_hi - m_lo) / dK
-                range_prob = max(0.0, min(1.0, range_prob))
-                cumulative_below += range_prob
-                cumulative_below = min(1.0, cumulative_below)
-                prob_above[k_hi] = 1.0 - cumulative_below
+                cdf_k_lo = max(0.0, min(1.0, (m_hi - m_lo) / dK))
+                prob_above[k_lo] = 1.0 - cdf_k_lo
 
     # Anchor at spot: P(S > spot) ≈ 0.5
     if spot not in prob_above:
