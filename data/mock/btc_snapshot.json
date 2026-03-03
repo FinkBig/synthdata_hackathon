@@ -1,0 +1,145 @@
+{
+  "asset": "BTC",
+  "spot": 95200,
+  "last_updated": "2026-03-02T14:30:00Z",
+  "mode": "demo",
+  "derive_curve": {
+    "88000": 0.971,
+    "89000": 0.958,
+    "90000": 0.941,
+    "91000": 0.919,
+    "92000": 0.891,
+    "93000": 0.855,
+    "94000": 0.807,
+    "95000": 0.501,
+    "96000": 0.412,
+    "97000": 0.318,
+    "98000": 0.228,
+    "99000": 0.151,
+    "100000": 0.091,
+    "101000": 0.049,
+    "102000": 0.023
+  },
+  "synth_curve": {
+    "88000": 0.965,
+    "89000": 0.948,
+    "90000": 0.927,
+    "91000": 0.899,
+    "92000": 0.862,
+    "93000": 0.814,
+    "94000": 0.752,
+    "95000": 0.481,
+    "96000": 0.371,
+    "97000": 0.265,
+    "98000": 0.174,
+    "99000": 0.104,
+    "100000": 0.058,
+    "101000": 0.028,
+    "102000": 0.011
+  },
+  "poly_points": [
+    {
+      "strike": 97000,
+      "market_type": "above_below",
+      "is_above": true,
+      "yes_price": 0.55,
+      "yes_bid": 0.53,
+      "yes_ask": 0.57,
+      "question": "Will Bitcoin be above $97,000 on March 2?",
+      "volume_24h": 125000
+    },
+    {
+      "strike": 98000,
+      "market_type": "above_below",
+      "is_above": true,
+      "yes_price": 0.42,
+      "yes_bid": 0.40,
+      "yes_ask": 0.44,
+      "question": "Will Bitcoin be above $98,000 on March 2?",
+      "volume_24h": 89000
+    },
+    {
+      "strike": 100000,
+      "market_type": "above_below",
+      "is_above": true,
+      "yes_price": 0.19,
+      "yes_bid": 0.17,
+      "yes_ask": 0.21,
+      "question": "Will Bitcoin be above $100,000 on March 2?",
+      "volume_24h": 212000
+    },
+    {
+      "strike": 93000,
+      "market_type": "above_below",
+      "is_above": false,
+      "yes_price": 0.14,
+      "yes_bid": 0.12,
+      "yes_ask": 0.16,
+      "question": "Will Bitcoin be below $93,000 on March 2?",
+      "volume_24h": 67000
+    },
+    {
+      "lower_bound": 94000,
+      "upper_bound": 96000,
+      "market_type": "daily_range",
+      "yes_price": 0.22,
+      "yes_bid": 0.20,
+      "yes_ask": 0.24,
+      "question": "Will Bitcoin be between $94,000 and $96,000 on March 2?",
+      "volume_24h": 44000
+    }
+  ],
+  "signals": [
+    {
+      "strategy": "short_vol",
+      "asset": "BTC",
+      "strike": 97000,
+      "direction": "SELL POLY YES / SELL CALL SPREAD",
+      "edge_pct": 0.085,
+      "synth_prob": 0.265,
+      "derive_prob": 0.318,
+      "poly_prob": 0.55,
+      "reasoning": "AI (27%) and options (32%) both price lower than Polymarket (55%) for BTC > $97,000. Edge: 8.5%. Sell Poly YES and hedge with short call spread.",
+      "confidence": "HIGH",
+      "poly_question": "Will Bitcoin be above $97,000 on March 2?"
+    },
+    {
+      "strategy": "short_vol",
+      "asset": "BTC",
+      "strike": 98000,
+      "direction": "SELL POLY YES / SELL CALL SPREAD",
+      "edge_pct": 0.046,
+      "synth_prob": 0.174,
+      "derive_prob": 0.228,
+      "poly_prob": 0.42,
+      "reasoning": "AI (17%) and options (23%) both price lower than Polymarket (42%) for BTC > $98,000. Edge: 4.6%. Sell Poly YES and hedge with short call spread.",
+      "confidence": "MEDIUM",
+      "poly_question": "Will Bitcoin be above $98,000 on March 2?"
+    },
+    {
+      "strategy": "the_pin",
+      "asset": "BTC",
+      "strike": 95000,
+      "direction": "BUY POLY YES (range)",
+      "edge_pct": 0.038,
+      "synth_prob": 0.24,
+      "derive_prob": 0.26,
+      "poly_prob": 0.22,
+      "reasoning": "Options $2,000-wide vertical at $94,000–$96,000 implies 26% range probability, but Polymarket only prices 22%. Edge: 3.8%. Buy Poly YES (range) — options underpricing pin risk.",
+      "confidence": "LOW",
+      "poly_question": "Will Bitcoin be between $94,000 and $96,000 on March 2?"
+    }
+  ],
+  "strike_table": [
+    {"strike": 92000, "synth_prob": 0.862, "derive_prob": 0.891, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false},
+    {"strike": 93000, "synth_prob": 0.814, "derive_prob": 0.855, "poly_prob": 0.86, "edge": 0.005, "action": "", "highlight": false},
+    {"strike": 94000, "synth_prob": 0.752, "derive_prob": 0.807, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false},
+    {"strike": 95000, "synth_prob": 0.481, "derive_prob": 0.501, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false},
+    {"strike": 96000, "synth_prob": 0.371, "derive_prob": 0.412, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false},
+    {"strike": 97000, "synth_prob": 0.265, "derive_prob": 0.318, "poly_prob": 0.55, "edge": 0.085, "action": "SELL POLY YES", "highlight": true},
+    {"strike": 98000, "synth_prob": 0.174, "derive_prob": 0.228, "poly_prob": 0.42, "edge": 0.046, "action": "SELL POLY YES", "highlight": true},
+    {"strike": 99000, "synth_prob": 0.104, "derive_prob": 0.151, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false},
+    {"strike": 100000, "synth_prob": 0.058, "derive_prob": 0.091, "poly_prob": 0.19, "edge": 0.032, "action": "SELL POLY YES", "highlight": true},
+    {"strike": 101000, "synth_prob": 0.028, "derive_prob": 0.049, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false}
+  ]
+}

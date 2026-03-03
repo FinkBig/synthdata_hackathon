@@ -1,0 +1,138 @@
+{
+  "asset": "ETH",
+  "spot": 3420,
+  "last_updated": "2026-03-02T14:30:00Z",
+  "mode": "demo",
+  "derive_curve": {
+    "2900": 0.987,
+    "3000": 0.971,
+    "3100": 0.941,
+    "3200": 0.882,
+    "3300": 0.791,
+    "3400": 0.501,
+    "3500": 0.328,
+    "3600": 0.198,
+    "3700": 0.109,
+    "3800": 0.054,
+    "3900": 0.024,
+    "4000": 0.009
+  },
+  "synth_curve": {
+    "2900": 0.981,
+    "3000": 0.961,
+    "3100": 0.924,
+    "3200": 0.851,
+    "3300": 0.741,
+    "3400": 0.487,
+    "3500": 0.301,
+    "3600": 0.171,
+    "3700": 0.088,
+    "3800": 0.041,
+    "3900": 0.017,
+    "4000": 0.006
+  },
+  "poly_points": [
+    {
+      "strike": 3200,
+      "market_type": "above_below",
+      "is_above": false,
+      "yes_price": 0.12,
+      "yes_bid": 0.10,
+      "yes_ask": 0.14,
+      "question": "Will Ethereum be below $3,200 on March 2?",
+      "volume_24h": 78000
+    },
+    {
+      "strike": 3300,
+      "market_type": "above_below",
+      "is_above": false,
+      "yes_price": 0.19,
+      "yes_bid": 0.17,
+      "yes_ask": 0.21,
+      "question": "Will Ethereum be below $3,300 on March 2?",
+      "volume_24h": 91000
+    },
+    {
+      "strike": 3500,
+      "market_type": "above_below",
+      "is_above": true,
+      "yes_price": 0.31,
+      "yes_bid": 0.29,
+      "yes_ask": 0.33,
+      "question": "Will Ethereum be above $3,500 on March 2?",
+      "volume_24h": 63000
+    },
+    {
+      "strike": 3600,
+      "market_type": "above_below",
+      "is_above": true,
+      "yes_price": 0.14,
+      "yes_bid": 0.12,
+      "yes_ask": 0.16,
+      "question": "Will Ethereum be above $3,600 on March 2?",
+      "volume_24h": 42000
+    },
+    {
+      "lower_bound": 3300,
+      "upper_bound": 3500,
+      "market_type": "daily_range",
+      "yes_price": 0.29,
+      "yes_bid": 0.27,
+      "yes_ask": 0.31,
+      "question": "Will Ethereum be between $3,300 and $3,500 on March 2?",
+      "volume_24h": 35000
+    }
+  ],
+  "signals": [
+    {
+      "strategy": "skew_arb",
+      "asset": "ETH",
+      "strike": 3200,
+      "direction": "SELL PUT SPREAD / BUY POLY NO",
+      "edge_pct": 0.062,
+      "synth_prob": 0.149,
+      "derive_prob": 0.118,
+      "poly_prob": 0.12,
+      "reasoning": "Options put skew at $3,200 implies 11.8% chance of downside — Polymarket prices 12%. BUT the options skew (vol smile) is 11% higher than the flat-vol estimate, suggesting put IV is elevated relative to the realized probability. Edge: 6.2%. Sell put spread (collect rich skew premium).",
+      "confidence": "MEDIUM",
+      "poly_question": "Will Ethereum be below $3,200 on March 2?"
+    },
+    {
+      "strategy": "skew_arb",
+      "asset": "ETH",
+      "strike": 3300,
+      "direction": "SELL PUT SPREAD / BUY POLY NO",
+      "edge_pct": 0.039,
+      "synth_prob": 0.259,
+      "derive_prob": 0.209,
+      "poly_prob": 0.19,
+      "reasoning": "Options put skew at $3,300 implies 20.9% chance of downside, but Polymarket only prices 19%. Edge: 3.9%. Sell put spread (collect elevated skew premium) or buy Poly NO.",
+      "confidence": "LOW",
+      "poly_question": "Will Ethereum be below $3,300 on March 2?"
+    },
+    {
+      "strategy": "the_pin",
+      "asset": "ETH",
+      "strike": 3400,
+      "direction": "BUY POLY YES (range)",
+      "edge_pct": 0.054,
+      "synth_prob": 0.36,
+      "derive_prob": 0.345,
+      "poly_prob": 0.29,
+      "reasoning": "Options $200-wide vertical at $3,300–$3,500 implies 34.5% range probability, but Polymarket only prices 29%. Edge: 5.4%. Buy Poly YES (range) — options underpricing pin risk around spot ($3,420).",
+      "confidence": "MEDIUM",
+      "poly_question": "Will Ethereum be between $3,300 and $3,500 on March 2?"
+    }
+  ],
+  "strike_table": [
+    {"strike": 3000, "synth_prob": 0.961, "derive_prob": 0.971, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false},
+    {"strike": 3100, "synth_prob": 0.924, "derive_prob": 0.941, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false},
+    {"strike": 3200, "synth_prob": 0.851, "derive_prob": 0.882, "poly_prob": 0.88, "edge": 0.062, "action": "SELL PUT SPREAD", "highlight": true},
+    {"strike": 3300, "synth_prob": 0.741, "derive_prob": 0.791, "poly_prob": 0.81, "edge": 0.039, "action": "SELL PUT SPREAD", "highlight": true},
+    {"strike": 3400, "synth_prob": 0.487, "derive_prob": 0.501, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false},
+    {"strike": 3500, "synth_prob": 0.301, "derive_prob": 0.328, "poly_prob": 0.31, "edge": 0.054, "action": "BUY POLY YES (range)", "highlight": true},
+    {"strike": 3600, "synth_prob": 0.171, "derive_prob": 0.198, "poly_prob": 0.14, "edge": 0.014, "action": "", "highlight": false},
+    {"strike": 3700, "synth_prob": 0.088, "derive_prob": 0.109, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false},
+    {"strike": 3800, "synth_prob": 0.041, "derive_prob": 0.054, "poly_prob": null, "edge": 0.0, "action": "", "highlight": false}
+  ]
+}
