@@ -10,6 +10,8 @@ export interface Signal {
   reasoning: string
   confidence: 'HIGH' | 'MEDIUM' | 'LOW'
   poly_question: string
+  poly_url: string
+  poly_expiry: string
 }
 
 export interface PolyPoint {
@@ -24,6 +26,8 @@ export interface PolyPoint {
   question: string
   volume_24h: number
   clob_token_id?: string
+  polymarket_url?: string
+  expiry?: string
 }
 
 export interface StrikeRow {
@@ -34,6 +38,13 @@ export interface StrikeRow {
   edge: number
   action: string
   highlight: boolean
+  derive_binary: number | null
+  derive_iv: number | null
+  derive_bid: number | null
+  derive_ask: number | null
+  derive_option_strike: number | null
+  poly_question: string
+  poly_url: string
 }
 
 export interface Snapshot {

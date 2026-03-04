@@ -41,13 +41,13 @@ export default function Dashboard({ snapshot, asset, livePolyPrices = {}, clobCo
       {/* Probability Chart */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
         <h2 className="text-sm font-semibold text-slate-300 mb-4 flex items-center gap-2">
-          <span>Probability Curves</span>
-          <span className="text-xs font-normal text-slate-500">P(S_T &gt; K) at {asset} 24h horizon</span>
+          <span>Probability</span>
+          <span className="text-xs font-normal text-slate-500">{asset} · nearest settlement · 0DTE options</span>
         </h2>
         <div className="flex gap-4 text-xs text-slate-400 mb-3">
-          <LegendItem color="bg-blue-500" label="SynthData AI" />
+          <LegendItem color="bg-slate-200" label="SynthData AI" />
           <LegendItem color="bg-orange-500" label="Derive (DVM)" />
-          <LegendItem color="bg-green-500" label="Polymarket" live={clobConnected} />
+          <LegendItem color="bg-blue-500" label="Polymarket" live={clobConnected} />
         </div>
         <ProbChart snapshot={snapshot} livePolyPrices={livePolyPrices} clobConnected={clobConnected} />
       </div>

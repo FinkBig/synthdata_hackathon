@@ -141,6 +141,81 @@ def _get_two_bracket_expiries(options, t_poly: float):
     return exp1, t1, exp2, t2
 
 
+def get_primary_tte(options, t_poly: float) -> float:
+    """Return the TTE (years) of the single nearest Derive expiry to t_poly."""
+    _, tte = _select_expiry(options, spot=0, target_hours=t_poly * 365.25 * 24)
+    return tte if tte > 0 else t_poly
+
+
+def derive_binary_for_strike(
+    options,
+    strike: float,
+    spot: float,
+    primary_tte: float,
+) -> Optional[Dict]:
+    """Compute BSM N(d2) binary price for a given strike from the live options chain.
+
+    Uses the nearest OTM option at the primary expiry:
+      - call when strike > spot (OTM call)
+      - put  when strike <= spot (OTM put)
+
+    Returns None if no option is within 5% of the requested strike.
+
+    Returns:
+        {binary, iv, bid, ask, option_strike, option_type}
+    """
+    if not options or spot <= 0 or primary_tte <= 0:
+        return None
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    # Find the expiry whose TTE is closest to primary_tte
+    best_expiry = None
+    best_diff = float("inf")
+    for opt in options:
+        exp_ts = opt.expiry.timestamp()
+        if exp_ts <= now_ts:
+            continue
+        tte = (exp_ts - now_ts) / (365.25 * 24 * 3600)
+        diff = abs(tte - primary_tte)
+        if diff < best_diff:
+            best_diff = diff
+            best_expiry = opt.expiry
+
+    if best_expiry is None:
+        return None
+
+    opt_type = "call" if strike > spot else "put"
+    candidates = [o for o in options if o.expiry == best_expiry and o.option_type == opt_type]
+    if not candidates:
+        return None
+
+    nearest = min(candidates, key=lambda o: abs(o.strike - strike))
+
+    # Reject if more than 5% away from requested strike
+    if abs(nearest.strike - strike) / max(strike, 1) > 0.05:
+        return None
+
+    iv = nearest.implied_volatility
+    if iv <= 0:
+        return None
+    if iv > 5:
+        iv /= 100.0
+
+    from scipy.stats import norm as _norm
+    d2 = (math.log(spot / strike) - 0.5 * iv ** 2 * primary_tte) / (iv * math.sqrt(primary_tte))
+    binary = float(_norm.cdf(d2))
+
+    return {
+        "binary": binary,
+        "iv": iv,
+        "bid": nearest.bid if nearest.bid > 0 else 0.0,
+        "ask": nearest.ask if nearest.ask > 0 else 0.0,
+        "option_strike": nearest.strike,
+        "option_type": opt_type,
+    }
+
+
 def _filter_by_expiry(options, expiry) -> list:
     """Filter options to a single expiry."""
     if expiry is None:
@@ -178,13 +253,14 @@ def build_derive_prob_curve(
 ) -> Dict[float, float]:
     """Returns {strike: P(S_T > strike)} using Discrete Vertical Mapping.
 
-    Uses two bracket expiries around T_poly and interpolates total variance
-    for better alignment with Polymarket settlement time.
+    Uses the single nearest Derive expiry to t_poly (always 0DTE or nearest 0DTE).
+    We only compare against the nearest Polymarket settlement and SynthData's 24h
+    forecast, so there is no reason to interpolate across multiple expiries.
 
     Args:
         options:      Full options chain (all expiries)
         spot:         Current underlying price
-        t_poly:       Polymarket settlement TTE in years
+        t_poly:       Polymarket settlement TTE in years (used to pick nearest expiry)
         strike_grid:  If provided, interpolate to this grid
 
     Returns:
@@ -193,10 +269,8 @@ def build_derive_prob_curve(
     if not options or spot <= 0:
         return {}
 
-    exp1, t1, exp2, t2 = _get_two_bracket_expiries(options, t_poly)
-
-    # Use exp2 as the primary expiry for the chain structure
-    primary_exp = exp2 if exp2 is not None else exp1
+    # Single nearest expiry to the Polymarket settlement horizon
+    primary_exp, primary_tte = _select_expiry(options, spot, target_hours=t_poly * 365.25 * 24)
     if primary_exp is None:
         return {}
 
@@ -204,19 +278,8 @@ def build_derive_prob_curve(
     if not chain:
         return {}
 
-    # Get ATM IVs for both bracket expiries
-    iv1 = _atm_iv_for_expiry(options, exp1, spot) if exp1 else 0.0
-    iv2 = _atm_iv_for_expiry(options, exp2, spot) if exp2 else 0.0
-
-    # BSM boundary TTE: use the primary chain's own expiry, not t_poly.
-    # When t_poly < t_primary (no option expires before Poly settlement), using t_poly
-    # gives a near-zero boundary while range probs encode the longer horizon —
-    # the accumulation overshoots 1.0 and zeroes out the entire above-spot curve.
-    primary_tte = t2 if (exp2 is not None and t2 > 0) else (t1 if t1 > 0 else t_poly)
-
-    # If we have both brackets, use variance-interpolated IV to scale option prices
-    # For the DVM, we use the option mid prices directly (no IV needed for spreads)
-    # IV is only used to double-check the probability is reasonable
+    # ATM IV for BSM boundary conditions (no cross-expiry interpolation needed)
+    iv_atm = _atm_iv_for_expiry(options, primary_exp, spot)
 
     # ── Build curve for calls (above spot) ──
     calls = sorted(
@@ -233,36 +296,17 @@ def build_derive_prob_curve(
     prob_above: Dict[float, float] = {}
 
     # --- Calls: P(S > K) from call spreads ---
-    # P(S > K_n) ≈ C(K_n).mid / spot  [for the highest strike, use intrinsic approx]
-    # P(K_i < S < K_{i+1}) = (C(K_i).mid - C(K_{i+1}).mid) / (K_{i+1} - K_i)
     if len(calls) >= 2:
-        # Derive returns prices in USD/USDC directly
         call_mids = [(o.strike, _mid(o.bid, o.ask, o.mark_price)) for o in calls]
-        # Filter: remove zero-mid options
         call_mids = [(k, m) for k, m in call_mids if m > 0]
 
         if len(call_mids) >= 2:
-            # Probability above the highest strike: approximate from BSM delta
-            # For simplicity, use put-call parity approximation: C(K)/S ≈ P(S > K) for deep OTM
-            # Actually: P(S > K_last) ≈ C_last / (S - K_last + C_last) — rough bound
-            # We'll use the last call's delta if available, else extrapolate
+            # Boundary: BSM N(d2) for the highest call strike
             k_last, m_last = call_mids[-1]
-            last_opt = next((o for o in calls if o.strike == k_last), None)
-            if last_opt and last_opt.implied_volatility > 0:
-                # Use BSM N(d2) as proxy for P(S > K_last) under real-world measure
-                iv_last = last_opt.implied_volatility
-                if iv_last > 5:
-                    iv_last /= 100.0
-                if iv1 > 0 and iv2 > 0 and t1 > 0 and t2 > 0:
-                    iv_interp = interpolate_variance_to_poly(iv1, t1, iv2, t2, t_poly)
-                    iv_last = iv_interp  # Use interpolated IV for boundary
-                import math as _math
-                if primary_tte > 0 and iv_last > 0:
-                    d2 = (_math.log(spot / k_last) + (-0.5 * iv_last ** 2) * primary_tte) / (iv_last * _math.sqrt(primary_tte))
-                    from scipy.stats import norm as _norm
-                    p_above_last = float(_norm.cdf(d2))
-                else:
-                    p_above_last = m_last / spot  # rough fallback
+            if primary_tte > 0 and iv_atm > 0:
+                d2 = (math.log(spot / k_last) - 0.5 * iv_atm ** 2 * primary_tte) / (iv_atm * math.sqrt(primary_tte))
+                from scipy.stats import norm as _norm
+                p_above_last = float(_norm.cdf(d2))
             else:
                 p_above_last = m_last / spot
 
@@ -276,50 +320,29 @@ def build_derive_prob_curve(
                 dK = k_hi - k_lo
                 if dK <= 0:
                     continue
-                range_prob = (m_lo - m_hi) / dK
-                range_prob = max(0.0, min(1.0, range_prob))
-                p_above_lo = prob_above.get(k_hi, 0.0) + range_prob
-                p_above_lo = max(0.0, min(1.0, p_above_lo))
+                range_prob = max(0.0, min(1.0, (m_lo - m_hi) / dK))
+                p_above_lo = min(1.0, prob_above.get(k_hi, 0.0) + range_prob)
                 prob_above[k_lo] = p_above_lo
 
     # --- Puts: P(S > K) from put spreads ---
-    # dP/dK ≈ CDF(K) = P(S < K), so each consecutive pair gives P(S > K_lo) directly:
-    #   P(S > K_lo) = 1 - (P(K_hi).mid - P(K_lo).mid) / (K_hi - K_lo)
     if len(puts) >= 2:
-        # Derive returns prices in USD/USDC directly
         put_mids = [(o.strike, _mid(o.bid, o.ask, o.mark_price)) for o in puts]
         put_mids = [(k, m) for k, m in put_mids if m > 0]
 
         if len(put_mids) >= 2:
-            # P(S < K_first) ≈ P(K).mid / (K - max_possible_loss) — rough
-            # Use the first put's intrinsic/delta
+            # Boundary: BSM N(-d2) for the lowest put strike
             k_first, m_first = put_mids[0]
-            first_opt = next((o for o in puts if o.strike == k_first), None)
-            if first_opt and first_opt.implied_volatility > 0:
-                iv_first = first_opt.implied_volatility
-                if iv_first > 5:
-                    iv_first /= 100.0
-                if iv1 > 0 and iv2 > 0 and t1 > 0 and t2 > 0:
-                    iv_interp = interpolate_variance_to_poly(iv1, t1, iv2, t2, t_poly)
-                    iv_first = iv_interp
-                import math as _math
-                if primary_tte > 0 and iv_first > 0:
-                    d2 = (_math.log(spot / k_first) + (-0.5 * iv_first ** 2) * primary_tte) / (iv_first * _math.sqrt(primary_tte))
-                    from scipy.stats import norm as _norm
-                    p_below_first = float(_norm.cdf(-d2))
-                else:
-                    p_below_first = m_first / spot
+            if primary_tte > 0 and iv_atm > 0:
+                d2 = (math.log(spot / k_first) - 0.5 * iv_atm ** 2 * primary_tte) / (iv_atm * math.sqrt(primary_tte))
+                from scipy.stats import norm as _norm
+                p_below_first = float(_norm.cdf(-d2))
             else:
                 p_below_first = m_first / spot
 
             p_below_first = max(0.0, min(1.0, p_below_first))
-            p_above_first = 1.0 - p_below_first
-            prob_above[k_first] = p_above_first
+            prob_above[k_first] = 1.0 - p_below_first
 
-            # Work forward — direct DVM assignment
-            # Key insight: (P(K_hi) - P(K_lo)) / dK ≈ dP/dK ≈ CDF(K_lo) = P(S < K_lo)
-            # NOT a range probability. Accumulating CDF values overshoots 1.0 near ATM.
-            # Instead, each spread directly gives P(S > K_lo) = 1 - CDF(K_lo).
+            # Direct DVM: each spread gives P(S > K_lo) = 1 - CDF(K_lo)
             for i in range(len(put_mids) - 1):
                 k_lo, m_lo = put_mids[i]
                 k_hi, m_hi = put_mids[i + 1]
@@ -336,7 +359,6 @@ def build_derive_prob_curve(
     if not strike_grid:
         return prob_above
 
-    # Interpolate to the requested grid
     return _interpolate_to_grid(prob_above, strike_grid)
 
 
@@ -466,14 +488,18 @@ def _nearest_strike_option(options_dict: Dict, target_strike: float):
     return options_dict[best_k]
 
 
-def compute_poly_settlement_tte() -> float:
-    """Compute TTE in years from now to next Polymarket settlement (17:00 UTC)."""
+def compute_poly_settlement_dt() -> datetime:
+    """Return the next Polymarket settlement datetime (17:00 UTC today or tomorrow)."""
     from datetime import timedelta
     now = datetime.now(timezone.utc)
-    # Today's 17:00 UTC
     today_settle = now.replace(hour=17, minute=0, second=0, microsecond=0)
     if now >= today_settle:
-        # Use tomorrow's settlement
         today_settle += timedelta(days=1)
-    tte_sec = (today_settle - now).total_seconds()
-    return tte_sec / (365.25 * 24 * 3600)
+    return today_settle
+
+
+def compute_poly_settlement_tte() -> float:
+    """Compute TTE in years from now to next Polymarket settlement (17:00 UTC)."""
+    now = datetime.now(timezone.utc)
+    settle = compute_poly_settlement_dt()
+    return (settle - now).total_seconds() / (365.25 * 24 * 3600)

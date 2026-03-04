@@ -25,6 +25,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from engine.prob_calc import (
     build_derive_prob_curve,
     compute_poly_settlement_tte,
+    compute_poly_settlement_dt,
+    get_primary_tte,
 )
 from engine.synth_mapper import build_synth_prob_curve, build_synth_pdf, build_derive_pdf
 from engine.arb_scanner import run_all_strategies, build_strike_table, Signal
@@ -127,9 +129,18 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
     percentile_data = await synth_client.get_prediction_percentiles(asset)
     has_synth = percentile_data is not None
 
-    # ── 4. Fetch Polymarket markets ──
+    # ── 4. Fetch Polymarket markets — nearest settlement date only ──
+    # SynthData gives 24h forecasts; we only compare against the single next
+    # settlement (17:00 UTC today or tomorrow). Drop all multi-day markets.
     all_poly = await poly_client.get_all_active_markets()
-    poly_markets = [m for m in all_poly if m.asset == asset]
+    settle_dt = compute_poly_settlement_dt()
+    settle_date = settle_dt.date()
+    poly_markets = [
+        m for m in all_poly
+        if m.asset == asset
+        and m.expiry is not None
+        and m.expiry.date() == settle_date
+    ]
     _poly_markets[asset] = poly_markets
 
     # Keep CLOB subscriptions up to date after each fetch
@@ -147,6 +158,7 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
 
     # ── 6. Build Derive probability curve ──
     derive_curve = build_derive_prob_curve(chain, spot, t_poly, strike_grid)
+    primary_tte = get_primary_tte(chain, t_poly)
 
     # ── 7. Build Synth probability curve ──
     synth_curve = {}
@@ -167,7 +179,11 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
     signals = run_all_strategies(asset, synth_curve, derive_curve, poly_markets, spot, chain, t_poly)
 
     # ── 10. Build strike table ──
-    strike_table = build_strike_table(asset, synth_curve, derive_curve, poly_markets, spot, signals)
+    strike_table = build_strike_table(
+        asset, synth_curve, derive_curve, poly_markets, spot, signals,
+        options=chain,
+        primary_tte=primary_tte,
+    )
 
     # ── 11. Format poly_points for UI ──
     poly_points = []
@@ -185,6 +201,8 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
             "question": m.question,
             "volume_24h": m.volume_24h,
             "clob_token_id": m.clob_token_id,
+            "polymarket_url": m.polymarket_url,
+            "expiry": m.expiry.isoformat() if m.expiry else None,
         })
 
     return {
@@ -216,6 +234,8 @@ def _signal_to_dict(s: Signal) -> Dict:
         "reasoning": s.reasoning,
         "confidence": s.confidence,
         "poly_question": s.poly_question,
+        "poly_url": s.poly_url,
+        "poly_expiry": s.poly_expiry,
     }
 
 

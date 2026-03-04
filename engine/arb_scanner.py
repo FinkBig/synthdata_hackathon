@@ -35,6 +35,8 @@ class Signal:
     reasoning: str       # Human-readable explanation
     confidence: str      # "HIGH" | "MEDIUM" | "LOW"
     poly_question: str = ""  # Matched Polymarket question
+    poly_url: str = ""       # Polymarket market URL
+    poly_expiry: str = ""    # ISO expiry datetime string
 
 
 def _confidence_from_edge(edge: float) -> str:
@@ -95,7 +97,7 @@ def scan_short_vol(
             strategy="short_vol",
             asset=asset,
             strike=strike,
-            direction="SELL POLY YES / SELL CALL SPREAD",
+            direction="BUY POLY NO / SELL CALL SPREAD",
             edge_pct=round(edge, 4),
             synth_prob=round(synth_prob, 4),
             derive_prob=round(derive_prob, 4),
@@ -103,10 +105,12 @@ def scan_short_vol(
             reasoning=(
                 f"AI ({synth_prob:.0%}) and options ({derive_prob:.0%}) both price "
                 f"lower than Polymarket ({poly_prob:.0%}) for {asset} > ${strike:,.0f}. "
-                f"Edge: {edge:.1%}. Sell Poly YES and hedge with short call spread."
+                f"Edge: {edge:.1%}. Buy Poly NO and hedge with short call spread."
             ),
             confidence=_confidence_from_edge(edge),
             poly_question=market.question,
+            poly_url=getattr(market, "polymarket_url", ""),
+            poly_expiry=market.expiry.isoformat() if market.expiry else "",
         ))
 
     # Sort by edge descending
@@ -173,7 +177,7 @@ def scan_skew_arb(
             strategy="skew_arb",
             asset=asset,
             strike=strike,
-            direction="SELL PUT SPREAD / BUY POLY NO",
+            direction="BUY POLY NO / SELL PUT SPREAD",
             edge_pct=round(edge, 4),
             synth_prob=round(synth_prob_below, 4) if synth_prob_below is not None else round(derive_prob_below, 4),
             derive_prob=round(derive_prob_below, 4),
@@ -185,6 +189,8 @@ def scan_skew_arb(
             ),
             confidence=_confidence_from_edge(edge),
             poly_question=market.question,
+            poly_url=getattr(market, "polymarket_url", ""),
+            poly_expiry=market.expiry.isoformat() if market.expiry else "",
         ))
 
     signals.sort(key=lambda s: s.edge_pct, reverse=True)
@@ -267,6 +273,8 @@ def scan_the_pin(
             ),
             confidence=_confidence_from_edge(edge),
             poly_question=market.question,
+            poly_url=getattr(market, "polymarket_url", ""),
+            poly_expiry=market.expiry.isoformat() if market.expiry else "",
         ))
 
     signals.sort(key=lambda s: s.edge_pct, reverse=True)
@@ -310,6 +318,8 @@ def build_strike_table(
     poly_markets,
     spot: float,
     signals: List[Signal],
+    options=None,
+    primary_tte: float = 0.0,
 ) -> List[Dict]:
     """Build the per-strike comparison table for the UI.
 
@@ -327,16 +337,26 @@ def build_strike_table(
         if market.asset == asset and market.strike:
             strikes.add(market.strike)
 
-    # Build a lookup for Polymarket prices by strike
+    # Build a lookup for Polymarket prices, questions, and URLs by strike
     poly_by_strike: Dict[float, float] = {}
     poly_question_by_strike: Dict[float, str] = {}
+    poly_url_by_strike: Dict[float, str] = {}
     for market in poly_markets:
         if market.asset != asset or not market.strike:
             continue
+        if market.market_type != "above_below" or not market.is_above:
+            continue
         mid = (market.yes_bid + market.yes_ask) / 2.0 if market.yes_ask > 0 else market.yes_price
-        if market.is_above:
-            poly_by_strike[market.strike] = mid
-            poly_question_by_strike[market.strike] = market.question
+        poly_by_strike[market.strike] = mid
+        poly_question_by_strike[market.strike] = market.question
+        poly_url_by_strike[market.strike] = getattr(market, "polymarket_url", "")
+
+    # Pre-compute derive binary data for all Polymarket above_below strikes
+    from engine.prob_calc import derive_binary_for_strike as _derive_binary
+    derive_bin_by_strike: Dict[float, Optional[Dict]] = {}
+    if options and primary_tte > 0:
+        for strike in poly_by_strike:
+            derive_bin_by_strike[strike] = _derive_binary(options, strike, spot, primary_tte)
 
     # Build signal lookup for actions
     signal_by_strike: Dict[float, Signal] = {}
@@ -353,10 +373,15 @@ def build_strike_table(
         if synth_p is None and derive_p is None:
             continue
 
+        # Use derive_binary when available, else fall back to DVM curve
+        bin_result = derive_bin_by_strike.get(strike)
+        derive_bin = bin_result["binary"] if bin_result else None
+        derive_for_edge = derive_bin if derive_bin is not None else derive_p
+
         edge = 0.0
         action = ""
-        if poly_p is not None and derive_p is not None:
-            edge = abs(poly_p - derive_p)
+        if poly_p is not None and derive_for_edge is not None:
+            edge = abs(poly_p - derive_for_edge)
         if strike in signal_by_strike:
             sig = signal_by_strike[strike]
             edge = sig.edge_pct
@@ -370,6 +395,13 @@ def build_strike_table(
             "edge": round(float(edge), 4),
             "action": action,
             "highlight": bool(edge >= EDGE_THRESHOLD),
+            "derive_binary": round(bin_result["binary"], 4) if bin_result else None,
+            "derive_iv": round(bin_result["iv"], 4) if bin_result else None,
+            "derive_bid": round(bin_result["bid"], 2) if bin_result else None,
+            "derive_ask": round(bin_result["ask"], 2) if bin_result else None,
+            "derive_option_strike": bin_result["option_strike"] if bin_result else None,
+            "poly_question": poly_question_by_strike.get(strike, ""),
+            "poly_url": poly_url_by_strike.get(strike, ""),
         })
 
     return rows
