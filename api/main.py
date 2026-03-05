@@ -15,7 +15,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, DefaultDict, Dict, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,8 +28,12 @@ from engine.prob_calc import (
     compute_poly_settlement_dt,
     get_primary_tte,
 )
-from engine.synth_mapper import build_synth_prob_curve, build_synth_pdf, build_derive_pdf
+from engine.synth_mapper import (
+    build_synth_prob_curve, build_synth_pdf, build_derive_pdf,
+    compute_synth_implied_vol,
+)
 from engine.arb_scanner import run_all_strategies, build_strike_table, Signal
+import engine.signal_tracker as signal_tracker
 
 # Clients
 from clients.binance import BinanceClient
@@ -183,6 +187,7 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
         asset, synth_curve, derive_curve, poly_markets, spot, signals,
         options=chain,
         primary_tte=primary_tte,
+        t_poly=t_poly,
     )
 
     # ── 11. Format poly_points for UI ──
@@ -205,7 +210,7 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
             "expiry": m.expiry.isoformat() if m.expiry else None,
         })
 
-    return {
+    snapshot = {
         "asset": asset,
         "spot": spot,
         "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -219,6 +224,14 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
         "strike_table": strike_table,
         "synth_status": synth_client.get_status(),
     }
+
+    # Persist signals to history (fire-and-forget; errors are non-fatal)
+    try:
+        await signal_tracker.save_signals(snapshot["signals"])
+    except Exception as e:
+        logger.debug("signal_tracker.save_signals error: %s", e)
+
+    return snapshot
 
 
 def _signal_to_dict(s: Signal) -> Dict:
@@ -236,6 +249,9 @@ def _signal_to_dict(s: Signal) -> Dict:
         "poly_question": s.poly_question,
         "poly_url": s.poly_url,
         "poly_expiry": s.poly_expiry,
+        "kelly_fraction": s.kelly_fraction,
+        "delta": s.delta,
+        "vega": s.vega,
     }
 
 
@@ -291,6 +307,12 @@ async def _refresh_loop():
         if token_ids:
             clob_ws.subscribe(token_ids)
 
+        # Check for settled Polymarket markets and update signal P&L
+        try:
+            await _check_settlements()
+        except Exception as e:
+            logger.debug("Settlement check error: %s", e)
+
 
 @app.on_event("startup")
 async def startup():
@@ -306,6 +328,99 @@ async def shutdown():
     await poly_client.close()
     await clob_ws.stop()
     await synth_client.close()
+
+
+# ── Settlement checker ───────────────────────────────────────────────────────
+
+async def _check_settlements() -> None:
+    """Fetch Gamma API for closed markets that match unsettled tracked signals."""
+    expired = await signal_tracker.get_unsettled_expiries()
+    if not expired:
+        return
+
+    session = await poly_client._ensure_session()
+    settlements = []
+    for item in expired:
+        url = item["poly_url"]
+        if not url:
+            continue
+        # Extract slug from URL: .../event/<slug>
+        slug = url.rstrip("/").split("/")[-1]
+        try:
+            api_url = f"https://gamma-api.polymarket.com/markets?slug={slug}&closed=true"
+            async with session.get(api_url) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+                markets = data if isinstance(data, list) else []
+                for m in markets:
+                    resolution = m.get("resolution") or m.get("outcome")
+                    if resolution in ("YES", "1", 1):
+                        settlements.append({"poly_url": url, "settlement_price": 1.0})
+                    elif resolution in ("NO", "0", 0):
+                        settlements.append({"poly_url": url, "settlement_price": 0.0})
+        except Exception as e:
+            logger.debug("Settlement fetch error for %s: %s", slug, e)
+
+    if settlements:
+        n = await signal_tracker.resolve_settlements(settlements)
+        if n:
+            logger.info("Resolved %d signal(s) from %d market settlement(s)", n, len(settlements))
+
+
+# ── Vol surface helper ────────────────────────────────────────────────────────
+
+def _build_vol_surface(chain, spot: float) -> List[Dict]:
+    """Extract per-expiry IV smile from the Derive options chain."""
+    from collections import defaultdict
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    by_expiry: Dict[Any, List] = defaultdict(list)
+    for opt in chain:
+        if opt.expiry.timestamp() > now_ts:
+            by_expiry[opt.expiry].append(opt)
+
+    surface = []
+    for expiry in sorted(by_expiry.keys()):
+        opts = by_expiry[expiry]
+        tte_hours = (expiry.timestamp() - now_ts) / 3600.0
+
+        call_ivs: Dict[float, float] = {}
+        put_ivs: Dict[float, float] = {}
+        for opt in opts:
+            if opt.implied_volatility <= 0:
+                continue
+            iv = opt.implied_volatility / 100.0 if opt.implied_volatility > 5 else opt.implied_volatility
+            if opt.option_type == "call":
+                call_ivs[opt.strike] = iv
+            else:
+                put_ivs[opt.strike] = iv
+
+        all_strikes = sorted(set(list(call_ivs) + list(put_ivs)))
+        points = []
+        for k in all_strikes:
+            if not (0.75 <= k / spot <= 1.25):
+                continue
+            c_iv = call_ivs.get(k)
+            p_iv = put_ivs.get(k)
+            if c_iv is None and p_iv is None:
+                continue
+            points.append({
+                "strike": k,
+                "moneyness_pct": round((k / spot - 1) * 100, 1),
+                "call_iv": round(c_iv, 4) if c_iv else None,
+                "put_iv": round(p_iv, 4) if p_iv else None,
+            })
+
+        if points:
+            surface.append({
+                "expiry": expiry.isoformat(),
+                "tte_hours": round(tte_hours, 1),
+                "label": f"{expiry.strftime('%b %d')} ({tte_hours:.0f}h)",
+                "strikes": points,
+            })
+
+    return surface
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -376,6 +491,50 @@ async def poly_live(asset: str):
         "connected": clob_ws.is_connected(),
         "asset": asset,
         "prices": prices,
+    }
+
+
+@app.get("/api/signals/history")
+async def signals_history(limit: int = 200):
+    """Return recent signal history with settlement P&L."""
+    rows = await signal_tracker.get_history(limit)
+    return {"signals": rows, "count": len(rows)}
+
+
+@app.get("/api/signals/pnl")
+async def signals_pnl():
+    """Return P&L summary across all tracked signals."""
+    return await signal_tracker.get_pnl()
+
+
+@app.get("/api/vol_surface/{asset}")
+async def vol_surface_endpoint(asset: str):
+    """Return per-expiry IV smile from Derive + SynthData ATM implied vol term structure."""
+    asset = asset.upper()
+    if asset not in ASSETS:
+        return JSONResponse({"error": f"Unknown asset: {asset}"}, status_code=400)
+
+    chain = await derive_client.get_options_chain(asset)
+    spot_price = await binance_client.get_spot_price(asset)
+    if not spot_price or spot_price <= 0:
+        spot_price = derive_client.get_spot_from_chain(chain)
+
+    derive_surface = _build_vol_surface(chain, spot_price) if chain and spot_price > 0 else []
+
+    # SynthData implied vol at key horizons (uses 30-min cached data)
+    synth_term: List[Dict] = []
+    percentile_data = synth_client.get_cached_percentiles(asset)
+    if percentile_data:
+        for hours in [1, 2, 4, 6, 8, 12, 16, 20, 24]:
+            iv = compute_synth_implied_vol(percentile_data, hours)
+            if iv:
+                synth_term.append({"hours_ahead": hours, "atm_iv": round(iv, 4)})
+
+    return {
+        "asset": asset,
+        "spot": spot_price,
+        "derive_surface": derive_surface,
+        "synth_term_structure": synth_term,
     }
 
 

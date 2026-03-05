@@ -1,4 +1,4 @@
-"""SynthData percentile → PDF reconstruction.
+"""SynthData percentile → PDF / vol surface reconstruction.
 
 SynthData /prediction-percentiles returns 289 time steps (5-min intervals),
 each with 9 quantile-price pairs:
@@ -16,6 +16,7 @@ Algorithm:
 """
 
 import logging
+import math
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -211,6 +212,34 @@ def build_derive_pdf(
         pdf[mid_k] = max(0.0, density)
 
     return pdf
+
+
+def compute_synth_implied_vol(percentile_data: Dict, hours_ahead: float) -> Optional[float]:
+    """Back out an ATM implied vol from the SynthData CDF at a given horizon.
+
+    Uses the interquartile range (Q25–Q75) of the predicted price distribution:
+        σ_implied = log(Q75 / Q25) / (2 × N_inv(0.75) × sqrt(T))
+    where N_inv(0.75) = 0.6745 (z-score at the 75th percentile).
+    """
+    prices, probs = _extract_cdf_points(percentile_data, hours_ahead)
+    if prices is None or len(prices) < 3:
+        return None
+
+    t_years = hours_ahead / (365.25 * 24)
+    if t_years <= 0:
+        return None
+
+    try:
+        inv_cdf = PchipInterpolator(probs, prices)
+        q25 = float(inv_cdf(0.25))
+        q75 = float(inv_cdf(0.75))
+        if q25 <= 0 or q75 <= q25:
+            return None
+        N_INV_75 = 0.6745
+        iv = math.log(q75 / q25) / (2.0 * N_INV_75 * math.sqrt(t_years))
+        return float(np.clip(iv, 0.05, 5.0))
+    except Exception:
+        return None
 
 
 def get_synth_spot_estimate(percentile_data: Dict, hours_ahead: float) -> Optional[float]:

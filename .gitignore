@@ -15,6 +15,9 @@ ui/dist/
 # Claude
 .claude/
 
+# Data / DB
+data/signals.db
+
 # OS
 .DS_Store
 *.log

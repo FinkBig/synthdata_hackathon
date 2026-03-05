@@ -12,7 +12,8 @@ Three strategies:
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -27,16 +28,19 @@ class Signal:
     strategy: str        # "short_vol" | "skew_arb" | "the_pin"
     asset: str           # "BTC" | "ETH"
     strike: float        # Mispriced strike
-    direction: str       # e.g. "SELL POLY YES" | "BUY PUT SPREAD" | "BUY POLY YES"
+    direction: str       # e.g. "BUY POLY NO" | "BUY PUT SPREAD" | "BUY POLY YES"
     edge_pct: float      # Discrepancy magnitude (min 3%)
     synth_prob: float    # AI probability at this strike
     derive_prob: float   # Options-implied probability
     poly_prob: float     # Polymarket price
     reasoning: str       # Human-readable explanation
     confidence: str      # "HIGH" | "MEDIUM" | "LOW"
-    poly_question: str = ""  # Matched Polymarket question
-    poly_url: str = ""       # Polymarket market URL
-    poly_expiry: str = ""    # ISO expiry datetime string
+    poly_question: str = ""      # Matched Polymarket question
+    poly_url: str = ""           # Polymarket market URL
+    poly_expiry: str = ""        # ISO expiry datetime string
+    kelly_fraction: float = 0.0  # Approximate Kelly bet size (fraction of bankroll)
+    delta: float = 0.0           # Options delta of the suggested Derive hedge leg
+    vega: float = 0.0            # Options vega per 1% vol move of the suggested hedge leg
 
 
 def _confidence_from_edge(edge: float) -> str:
@@ -93,6 +97,9 @@ def scan_short_vol(
         if not (synth_prob < derive_prob < poly_prob):
             continue
 
+        # Kelly fraction: buying NO at (1-poly_prob), estimated win prob = 1-synth_prob
+        kelly = min((poly_prob - synth_prob) / max(poly_prob, 0.01), 0.25)
+
         signals.append(Signal(
             strategy="short_vol",
             asset=asset,
@@ -111,6 +118,7 @@ def scan_short_vol(
             poly_question=market.question,
             poly_url=getattr(market, "polymarket_url", ""),
             poly_expiry=market.expiry.isoformat() if market.expiry else "",
+            kelly_fraction=round(kelly, 4),
         ))
 
     # Sort by edge descending
@@ -173,6 +181,9 @@ def scan_skew_arb(
         if edge < EDGE_THRESHOLD:
             continue
 
+        # Kelly fraction: selling the put spread (risk = derive_prob_below per unit)
+        kelly = min(edge / max(derive_prob_below, 0.01), 0.25)
+
         signals.append(Signal(
             strategy="skew_arb",
             asset=asset,
@@ -191,6 +202,7 @@ def scan_skew_arb(
             poly_question=market.question,
             poly_url=getattr(market, "polymarket_url", ""),
             poly_expiry=market.expiry.isoformat() if market.expiry else "",
+            kelly_fraction=round(kelly, 4),
         ))
 
     signals.sort(key=lambda s: s.edge_pct, reverse=True)
@@ -236,8 +248,15 @@ def scan_the_pin(
 
         poly_prob = (market.yes_bid + market.yes_ask) / 2.0 if market.yes_ask > 0 else market.yes_price
 
-        # Derive range probability from options chain
-        derive_range = range_probability(K1, K2, options, spot, t_poly)
+        # Use this market's actual expiry TTE (not the global 17:00 UTC proxy)
+        now = datetime.now(timezone.utc)
+        if market.expiry and market.expiry > now:
+            t_market = (market.expiry - now).total_seconds() / (365.25 * 24 * 3600)
+        else:
+            t_market = t_poly
+
+        # Derive range probability from options chain using per-market TTE
+        derive_range = range_probability(K1, K2, options, spot, t_market)
         if derive_range is None:
             # Fallback: compute from the prob curve
             p_above_k1 = _lookup_prob(derive_curve, K1)
@@ -257,6 +276,9 @@ def scan_the_pin(
         if edge < EDGE_THRESHOLD:
             continue
 
+        # Kelly fraction: buying YES at poly_prob, estimated win prob = derive_range
+        kelly = min((derive_range - poly_prob) / max(1 - poly_prob, 0.01), 0.25)
+
         signals.append(Signal(
             strategy="the_pin",
             asset=asset,
@@ -275,6 +297,7 @@ def scan_the_pin(
             poly_question=market.question,
             poly_url=getattr(market, "polymarket_url", ""),
             poly_expiry=market.expiry.isoformat() if market.expiry else "",
+            kelly_fraction=round(kelly, 4),
         ))
 
     signals.sort(key=lambda s: s.edge_pct, reverse=True)
@@ -308,6 +331,16 @@ def run_all_strategies(
             seen.add(key)
             unique.append(s)
 
+    # Enrich with BSM Greeks using the nearest-expiry ATM IV
+    if options and t_poly > 0:
+        from engine.greeks import get_atm_iv_from_chain, greeks_for_signal
+        iv = get_atm_iv_from_chain(options, spot, t_poly)
+        if iv > 0:
+            for sig in unique:
+                g = greeks_for_signal(sig.strategy, sig.strike, spot, iv, t_poly)
+                sig.delta = g["delta"]
+                sig.vega = g["vega"]
+
     return unique
 
 
@@ -320,6 +353,7 @@ def build_strike_table(
     signals: List[Signal],
     options=None,
     primary_tte: float = 0.0,
+    t_poly: float = 0.0,
 ) -> List[Dict]:
     """Build the per-strike comparison table for the UI.
 
@@ -351,12 +385,20 @@ def build_strike_table(
         poly_question_by_strike[market.strike] = market.question
         poly_url_by_strike[market.strike] = getattr(market, "polymarket_url", "")
 
+    # Per-market TTE: use the actual Polymarket market expiry, not the global 17:00 proxy
+    now = datetime.now(timezone.utc)
+    poly_market_ttes: Dict[float, float] = {}
+    for m in poly_markets:
+        if m.asset == asset and m.strike and m.expiry and m.expiry > now:
+            poly_market_ttes[m.strike] = (m.expiry - now).total_seconds() / (365.25 * 24 * 3600)
+
     # Pre-compute derive binary data for all Polymarket above_below strikes
     from engine.prob_calc import derive_binary_for_strike as _derive_binary
     derive_bin_by_strike: Dict[float, Optional[Dict]] = {}
     if options and primary_tte > 0:
         for strike in poly_by_strike:
-            derive_bin_by_strike[strike] = _derive_binary(options, strike, spot, primary_tte)
+            t_market = poly_market_ttes.get(strike) or (t_poly if t_poly > 0 else None)
+            derive_bin_by_strike[strike] = _derive_binary(options, strike, spot, primary_tte, t_market)
 
     # Build signal lookup for actions
     signal_by_strike: Dict[float, Signal] = {}

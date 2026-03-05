@@ -274,6 +274,10 @@ class PolymarketClient:
                 return "monthly_hit"
             if "by " in q:
                 return "yearly_hit"
+            # "dip below $X" without a date range is an above_below market with a price target.
+            # "reach" / "hit" without a date context are undated price targets → filter out.
+            if "dip" in q and "reach" not in q and "hit" not in q:
+                return "above_below"
             return "weekly_hit"
 
         return "above_below"

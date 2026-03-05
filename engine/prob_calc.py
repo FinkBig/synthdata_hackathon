@@ -152,6 +152,7 @@ def derive_binary_for_strike(
     strike: float,
     spot: float,
     primary_tte: float,
+    t_poly: Optional[float] = None,
 ) -> Optional[Dict]:
     """Compute BSM N(d2) binary price for a given strike from the live options chain.
 
@@ -202,8 +203,13 @@ def derive_binary_for_strike(
     if iv > 5:
         iv /= 100.0
 
+    # Use t_poly (Polymarket settlement horizon) as T in BSM — not the option expiry.
+    # primary_tte is only used to select the right option for IV; the probability
+    # must be evaluated at t_poly so it is comparable to the Polymarket price.
+    T = t_poly if (t_poly is not None and t_poly > 0) else primary_tte
+
     from scipy.stats import norm as _norm
-    d2 = (math.log(spot / strike) - 0.5 * iv ** 2 * primary_tte) / (iv * math.sqrt(primary_tte))
+    d2 = (math.log(spot / strike) - 0.5 * iv ** 2 * T) / (iv * math.sqrt(T))
     binary = float(_norm.cdf(d2))
 
     return {
@@ -269,7 +275,7 @@ def build_derive_prob_curve(
     if not options or spot <= 0:
         return {}
 
-    # Single nearest expiry to the Polymarket settlement horizon
+    # Single nearest expiry to the Polymarket settlement horizon (for DVM chain)
     primary_exp, primary_tte = _select_expiry(options, spot, target_hours=t_poly * 365.25 * 24)
     if primary_exp is None:
         return {}
@@ -278,8 +284,19 @@ def build_derive_prob_curve(
     if not chain:
         return {}
 
-    # ATM IV for BSM boundary conditions (no cross-expiry interpolation needed)
+    # ── Variance-interpolated IV for BSM boundary conditions ──
+    # The DVM spread probabilities reflect the option expiry distribution (primary_tte).
+    # For boundary anchors we project to t_poly using total-variance interpolation between
+    # the two Derive expiries that bracket the Polymarket settlement horizon.
     iv_atm = _atm_iv_for_expiry(options, primary_exp, spot)
+    exp1, t1_y, exp2, t2_y = _get_two_bracket_expiries(options, t_poly)
+    iv1_y = _atm_iv_for_expiry(options, exp1, spot) if exp1 else 0.0
+    iv2_y = _atm_iv_for_expiry(options, exp2, spot) if exp2 else 0.0
+    if iv2_y > 0 and t_poly > 0:
+        iv_for_poly = interpolate_variance_to_poly(iv1_y, t1_y, iv2_y, t2_y, t_poly)
+    else:
+        iv_for_poly = iv_atm  # fallback: use nearest expiry IV as-is
+    T_bsm = t_poly if t_poly > 0 else primary_tte
 
     # ── Build curve for calls (above spot) ──
     calls = sorted(
@@ -301,10 +318,10 @@ def build_derive_prob_curve(
         call_mids = [(k, m) for k, m in call_mids if m > 0]
 
         if len(call_mids) >= 2:
-            # Boundary: BSM N(d2) for the highest call strike
+            # Boundary: BSM N(d2) anchored to Polymarket settlement horizon (T_bsm, iv_for_poly)
             k_last, m_last = call_mids[-1]
-            if primary_tte > 0 and iv_atm > 0:
-                d2 = (math.log(spot / k_last) - 0.5 * iv_atm ** 2 * primary_tte) / (iv_atm * math.sqrt(primary_tte))
+            if T_bsm > 0 and iv_for_poly > 0:
+                d2 = (math.log(spot / k_last) - 0.5 * iv_for_poly ** 2 * T_bsm) / (iv_for_poly * math.sqrt(T_bsm))
                 from scipy.stats import norm as _norm
                 p_above_last = float(_norm.cdf(d2))
             else:
@@ -330,10 +347,10 @@ def build_derive_prob_curve(
         put_mids = [(k, m) for k, m in put_mids if m > 0]
 
         if len(put_mids) >= 2:
-            # Boundary: BSM N(-d2) for the lowest put strike
+            # Boundary: BSM N(-d2) anchored to Polymarket settlement horizon (T_bsm, iv_for_poly)
             k_first, m_first = put_mids[0]
-            if primary_tte > 0 and iv_atm > 0:
-                d2 = (math.log(spot / k_first) - 0.5 * iv_atm ** 2 * primary_tte) / (iv_atm * math.sqrt(primary_tte))
+            if T_bsm > 0 and iv_for_poly > 0:
+                d2 = (math.log(spot / k_first) - 0.5 * iv_for_poly ** 2 * T_bsm) / (iv_for_poly * math.sqrt(T_bsm))
                 from scipy.stats import norm as _norm
                 p_below_first = float(_norm.cdf(-d2))
             else:

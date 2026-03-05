@@ -113,6 +113,36 @@ export default function SignalCard({ signal }: Props) {
         <ProbCell label="Polymarket" prob={signal.poly_prob} color="text-blue-400" />
       </div>
 
+      {/* Kelly + Greeks row */}
+      {(signal.kelly_fraction != null || signal.delta != null) && (
+        <div className="grid grid-cols-3 gap-2 text-center">
+          {signal.kelly_fraction != null && (
+            <MetaCell
+              label="Kelly"
+              value={`${(signal.kelly_fraction * 100).toFixed(1)}%`}
+              color="text-yellow-300"
+              title="Approximate Kelly fraction (fraction of bankroll)"
+            />
+          )}
+          {signal.delta != null && (
+            <MetaCell
+              label="Δ Delta"
+              value={signal.delta.toFixed(3)}
+              color={signal.delta >= 0 ? 'text-green-400' : 'text-red-400'}
+              title="BSM delta of Derive options hedge leg"
+            />
+          )}
+          {signal.vega != null && (
+            <MetaCell
+              label="ν Vega"
+              value={signal.vega.toFixed(4)}
+              color="text-cyan-400"
+              title="Vega per 1% vol point of Derive options hedge leg"
+            />
+          )}
+        </div>
+      )}
+
       {/* Direction action badge */}
       <div className={`text-xs font-semibold px-3 py-1.5 rounded-lg text-center ${directionClass}`}>
         {signal.direction}
@@ -157,6 +187,15 @@ function ProbCell({ label, prob, color }: { label: string; prob: number; color: 
       <p className={`font-mono font-bold text-sm ${color}`}>
         {(prob * 100).toFixed(0)}%
       </p>
+    </div>
+  )
+}
+
+function MetaCell({ label, value, color, title }: { label: string; value: string; color: string; title?: string }) {
+  return (
+    <div className="bg-slate-800/30 rounded-lg py-1.5" title={title}>
+      <p className="text-xs text-slate-600">{label}</p>
+      <p className={`font-mono font-semibold text-xs ${color}`}>{value}</p>
     </div>
   )
 }

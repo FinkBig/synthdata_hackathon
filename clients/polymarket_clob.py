@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
@@ -18,7 +19,7 @@ _BACKOFF_MAX = 60
 
 class PolymarketClobWs:
     def __init__(self):
-        self._prices: Dict[str, Tuple[float, float]] = {}  # token_id -> (best_bid, best_ask)
+        self._prices: Dict[str, Tuple[float, float, float]] = {}  # token_id -> (best_bid, best_ask, ts)
         self._connected = False
         self._subscribed_ids: List[str] = []
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -33,10 +34,18 @@ class PolymarketClobWs:
             asyncio.create_task(self._send_subscribe(self._ws, token_ids))
 
     def get_price(self, token_id: str) -> Optional[Tuple[float, float]]:
-        return self._prices.get(token_id)
+        entry = self._prices.get(token_id)
+        if entry is None:
+            return None
+        return entry[0], entry[1]
+
+    def get_price_age(self, token_id: str) -> Optional[float]:
+        """Returns seconds since last price update, or None if never seen."""
+        entry = self._prices.get(token_id)
+        return (time.time() - entry[2]) if entry else None
 
     def all_prices(self) -> Dict[str, Tuple[float, float]]:
-        return dict(self._prices)
+        return {k: (v[0], v[1]) for k, v in self._prices.items()}
 
     def is_connected(self) -> bool:
         return self._connected
@@ -154,7 +163,7 @@ class PolymarketClobWs:
                 break
 
         async with self._lock:
-            self._prices[asset_id] = (best_bid, best_ask)
+            self._prices[asset_id] = (best_bid, best_ask, time.time())
 
     async def _handle_price_change(self, event: Dict) -> None:
         """Incremental update — each change carries best_bid/best_ask directly."""
@@ -168,23 +177,26 @@ class PolymarketClobWs:
             raw_ask = change.get("best_ask")
             if raw_bid is not None and raw_ask is not None:
                 async with self._lock:
-                    self._prices[asset_id] = (float(raw_bid), float(raw_ask))
+                    self._prices[asset_id] = (float(raw_bid), float(raw_ask), time.time())
                 continue
 
-            # Fallback: apply the individual level change manually
+            # Fallback: apply the individual level change manually.
+            # When size==0 a level was removed; without full book state we can't
+            # reliably determine the new best, so we skip and wait for the next
+            # authoritative best_bid_ask event (fired by custom_feature_enabled=True).
             async with self._lock:
-                best_bid, best_ask = self._prices.get(asset_id, (0.0, 1.0))
+                entry = self._prices.get(asset_id, (0.0, 1.0, 0.0))
+                best_bid, best_ask, ts = entry
                 side = change.get("side", "").upper()
                 price = float(change.get("price", 0))
                 size = float(change.get("size", 0))
 
-                if side == "BUY" and size > 0 and price > best_bid:
-                    best_bid = price
-                elif side == "SELL" and size > 0 and price < best_ask:
-                    best_ask = price
-                # size == 0 means level removed — keep stale best
-
-                self._prices[asset_id] = (best_bid, best_ask)
+                if size > 0:
+                    if side == "BUY" and price > best_bid:
+                        best_bid = price
+                    elif side == "SELL" and price < best_ask:
+                        best_ask = price
+                    self._prices[asset_id] = (best_bid, best_ask, time.time())
 
     async def _handle_best_bid_ask(self, event: Dict) -> None:
         """Direct best bid/ask update (custom_feature_enabled=True)."""
@@ -195,4 +207,4 @@ class PolymarketClobWs:
         raw_ask = event.get("best_ask")
         if raw_bid is not None and raw_ask is not None:
             async with self._lock:
-                self._prices[asset_id] = (float(raw_bid), float(raw_ask))
+                self._prices[asset_id] = (float(raw_bid), float(raw_ask), time.time())

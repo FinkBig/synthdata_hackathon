@@ -1,14 +1,18 @@
 import { useState, useEffect, useCallback } from 'react'
 import Dashboard from './components/Dashboard'
+import SignalHistory from './components/SignalHistory'
+import VolSurface from './components/VolSurface'
 import { Snapshot } from './types'
 
 const ASSETS = ['BTC', 'ETH'] as const
 type Asset = typeof ASSETS[number]
+type View = 'dashboard' | 'vol_surface' | 'history'
 
 interface LivePolyPrice { bid: number; ask: number; mid: number }
 
 function App() {
   const [asset, setAsset] = useState<Asset>('BTC')
+  const [view, setView] = useState<View>('dashboard')
   const [snapshots, setSnapshots] = useState<Record<Asset, Snapshot | null>>({ BTC: null, ETH: null })
   const [loading, setLoading] = useState(false)
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null)
@@ -87,7 +91,24 @@ function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            {/* View navigation */}
+            <nav className="flex gap-1">
+              {(['dashboard', 'vol_surface', 'history'] as View[]).map(v => (
+                <button
+                  key={v}
+                  onClick={() => setView(v)}
+                  className={`text-xs px-3 py-1.5 rounded-lg transition-colors ${
+                    view === v
+                      ? 'bg-slate-700 text-slate-100'
+                      : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  {v === 'dashboard' ? 'Dashboard' : v === 'vol_surface' ? 'Vol Surface' : 'History'}
+                </button>
+              ))}
+            </nav>
+
             {/* Mode badge */}
             {currentSnapshot && (
               <span className={`text-xs font-medium px-2 py-1 rounded-full ${
@@ -103,7 +124,7 @@ function App() {
 
             {lastRefresh && (
               <span className="text-xs text-slate-500">
-                Updated {lastRefresh.toLocaleTimeString()}
+                {lastRefresh.toLocaleTimeString()}
               </span>
             )}
 
@@ -156,7 +177,11 @@ function App() {
 
       {/* Main content */}
       <main className="max-w-7xl mx-auto px-4 pb-12">
-        {loading && !currentSnapshot ? (
+        {view === 'history' ? (
+          <SignalHistory />
+        ) : view === 'vol_surface' ? (
+          <VolSurface asset={asset} />
+        ) : loading && !currentSnapshot ? (
           <div className="flex items-center justify-center h-64 text-slate-400">
             <div className="text-center">
               <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
