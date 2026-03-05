@@ -89,6 +89,12 @@ def _load_mock(asset: str) -> Dict:
             data = json.load(f)
         data["mode"] = "demo"
         data["last_updated"] = datetime.now(timezone.utc).isoformat()
+        # Inject mock risk fields so demo mode shows the full feature set
+        data.setdefault("vol_regime", "expanding")
+        data.setdefault("forecast_vol", 0.68)
+        data.setdefault("realized_vol", 0.52)
+        data.setdefault("synth_poly_edge", 0.16)
+        data["synth_status"] = synth_client.get_status()  # always fresh
         return data
     return {"error": f"No mock data for {asset}", "mode": "demo"}
 
@@ -129,9 +135,37 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
         logger.warning("No live data for %s — falling back to mock", asset)
         return _load_mock(asset)
 
-    # ── 3. Fetch SynthData percentiles ──
-    percentile_data = await synth_client.get_prediction_percentiles(asset)
+    # ── 3. Fetch all SynthData endpoints in parallel ──
+    _sd_results = await asyncio.gather(
+        synth_client.get_prediction_percentiles(asset),
+        synth_client.get_volatility(asset),
+        synth_client.get_lp_probabilities(asset),
+        synth_client.get_lp_bounds(asset),
+        synth_client.get_liquidation(asset),
+        synth_client.get_polymarket_signal(asset),
+        return_exceptions=True,
+    )
+    def _ok(v):
+        return v if v is not None and not isinstance(v, Exception) else None
+
+    percentile_data  = _ok(_sd_results[0])
+    vol_data         = _ok(_sd_results[1])
+    lp_probs_data    = _ok(_sd_results[2])
+    lp_bounds_data   = _ok(_sd_results[3])
+    liq_data         = _ok(_sd_results[4])
+    poly_signal_data = _ok(_sd_results[5])
     has_synth = percentile_data is not None
+
+    # Derive vol regime from SynthData volatility
+    vol_regime = "stable"
+    forecast_vol: Optional[float] = None
+    realized_vol: Optional[float] = None
+    if vol_data:
+        forecast_vol = vol_data.get("forecast_future", {}).get("average")
+        realized_vol = vol_data.get("realized", {}).get("average_volatility")
+        if forecast_vol and realized_vol and realized_vol > 0:
+            ratio = forecast_vol / realized_vol
+            vol_regime = "expanding" if ratio > 1.5 else "compressing" if ratio < 0.7 else "stable"
 
     # ── 4. Fetch Polymarket markets — nearest settlement date only ──
     # SynthData gives 24h forecasts; we only compare against the single next
@@ -222,6 +256,10 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
         "poly_points": poly_points,
         "signals": [_signal_to_dict(s) for s in signals],
         "strike_table": strike_table,
+        "vol_regime": vol_regime,
+        "forecast_vol": round(forecast_vol, 4) if forecast_vol else None,
+        "realized_vol": round(realized_vol, 4) if realized_vol else None,
+        "synth_poly_edge": _extract_poly_edge(poly_signal_data),
         "synth_status": synth_client.get_status(),
     }
 
@@ -423,16 +461,31 @@ def _build_vol_surface(chain, spot: float) -> List[Dict]:
     return surface
 
 
+def _extract_poly_edge(poly_signal_data: Optional[Dict]) -> Optional[float]:
+    """Extract edge magnitude from SynthData's polymarket/up-down/daily response."""
+    if not poly_signal_data:
+        return None
+    try:
+        synth_p = float(poly_signal_data.get("synth_probability_up", 0))
+        poly_p  = float(poly_signal_data.get("polymarket_probability_up", 0))
+        return round(abs(synth_p - poly_p), 4) if synth_p and poly_p else None
+    except (TypeError, ValueError):
+        return None
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
+    synth_status = synth_client.get_status()
     return {
         "status": "ok",
         "mock_mode": MOCK_MODE,
         "assets": ASSETS,
         "spot_source": "binance",
         "synth_enabled": synth_client.enabled,
+        "synth_credits_remaining": synth_status["credits_remaining"],
+        "synth_credits_used": synth_status["credits_used"],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -535,6 +588,95 @@ async def vol_surface_endpoint(asset: str):
         "spot": spot_price,
         "derive_surface": derive_surface,
         "synth_term_structure": synth_term,
+    }
+
+
+@app.get("/api/risk/{asset}")
+async def risk_data(asset: str):
+    """Return full SynthData risk dataset for an asset.
+    Used by the position sizer for leverage optimisation and CONVICTION scoring.
+    All data is served from the client's in-process cache — no extra credits consumed
+    if /api/snapshot was fetched recently."""
+    asset = asset.upper()
+    if asset not in ASSETS:
+        return JSONResponse({"error": f"Unknown asset: {asset}"}, status_code=400)
+
+    if MOCK_MODE:
+        return _mock_risk_data(asset)
+
+    # Fetch from client — each call returns cached data if within TTL
+    vol_data, lp_probs, lp_bounds, liq_data, poly_signal = await asyncio.gather(
+        synth_client.get_volatility(asset),
+        synth_client.get_lp_probabilities(asset),
+        synth_client.get_lp_bounds(asset),
+        synth_client.get_liquidation(asset),
+        synth_client.get_polymarket_signal(asset),
+        return_exceptions=True,
+    )
+    def _ok(v):
+        return v if v is not None and not isinstance(v, Exception) else None
+
+    vol_data    = _ok(vol_data)
+    lp_probs    = _ok(lp_probs)
+    lp_bounds   = _ok(lp_bounds)
+    liq_data    = _ok(liq_data)
+    poly_signal = _ok(poly_signal)
+
+    forecast_vol: Optional[float] = None
+    realized_vol: Optional[float] = None
+    vol_regime = "stable"
+    if vol_data:
+        forecast_vol = vol_data.get("forecast_future", {}).get("average")
+        realized_vol = vol_data.get("realized", {}).get("average_volatility")
+        if forecast_vol and realized_vol and realized_vol > 0:
+            ratio = forecast_vol / realized_vol
+            vol_regime = "expanding" if ratio > 1.5 else "compressing" if ratio < 0.7 else "stable"
+
+    return {
+        "asset": asset,
+        "vol_regime": vol_regime,
+        "forecast_vol": round(forecast_vol, 4) if forecast_vol else None,
+        "realized_vol": round(realized_vol, 4) if realized_vol else None,
+        "lp_bounds": lp_bounds.get("data") if lp_bounds else None,
+        "lp_probabilities": lp_probs.get("data") if lp_probs else None,
+        "liquidation_table": liq_data.get("data") if liq_data else None,
+        "synth_poly_signal": poly_signal,
+        "synth_poly_edge": _extract_poly_edge(poly_signal),
+        "credits_remaining": synth_client.credits_remaining(),
+    }
+
+
+def _mock_risk_data(asset: str) -> Dict:
+    """Realistic mock risk data for demo mode."""
+    spot = 95_200 if asset == "BTC" else 3_420
+    return {
+        "asset": asset,
+        "vol_regime": "expanding",
+        "forecast_vol": 0.68,
+        "realized_vol": 0.52,
+        "lp_bounds": [
+            {"interval": {"full_width": "2.0%", "lower_bound": round(spot * 0.99), "upper_bound": round(spot * 1.01)},
+             "probability_to_stay_in_interval": {"24": 0.32}, "expected_time_in_interval": 7.7, "expected_impermanent_loss": 0.0041},
+            {"interval": {"full_width": "4.0%", "lower_bound": round(spot * 0.98), "upper_bound": round(spot * 1.02)},
+             "probability_to_stay_in_interval": {"24": 0.54}, "expected_time_in_interval": 13.0, "expected_impermanent_loss": 0.0082},
+            {"interval": {"full_width": "6.0%", "lower_bound": round(spot * 0.97), "upper_bound": round(spot * 1.03)},
+             "probability_to_stay_in_interval": {"24": 0.71}, "expected_time_in_interval": 17.1, "expected_impermanent_loss": 0.0124},
+        ],
+        "liquidation_table": [
+            {"price_change": 0.02, "long_liquidation_probability": {"24": 0.48}, "short_liquidation_probability": {"24": 0.42}},
+            {"price_change": 0.05, "long_liquidation_probability": {"24": 0.22}, "short_liquidation_probability": {"24": 0.18}},
+            {"price_change": 0.10, "long_liquidation_probability": {"24": 0.07}, "short_liquidation_probability": {"24": 0.06}},
+            {"price_change": 0.14, "long_liquidation_probability": {"24": 0.03}, "short_liquidation_probability": {"24": 0.02}},
+            {"price_change": 0.20, "long_liquidation_probability": {"24": 0.01}, "short_liquidation_probability": {"24": 0.009}},
+        ],
+        "synth_poly_signal": {
+            "synth_probability_up": 0.54,
+            "polymarket_probability_up": 0.38,
+            "synth_outcome": "UP",
+            "polymarket_outcome": "DOWN",
+        },
+        "synth_poly_edge": 0.16,
+        "credits_remaining": 18983,
     }
 
 
