@@ -64,11 +64,33 @@ export interface SynthTermPoint {
   atm_iv: number
 }
 
+export interface PolyIVPoint {
+  strike: number
+  moneyness_pct: number
+  poly_iv: number
+  market_type: string
+  yes_price: number
+  expiry: string
+}
+
+export interface DivergenceAlert {
+  source_a: string
+  source_b: string
+  iv_a: number
+  iv_b: number
+  gap_vol_pts: number
+  severity: 'HIGH' | 'MEDIUM'
+}
+
 export interface VolSurfaceData {
   asset: string
   spot: number
   derive_surface: VolSurfaceExpiry[]
   synth_term_structure: SynthTermPoint[]
+  poly_iv_points?: PolyIVPoint[]
+  atm_ivs?: { derive: number | null; synth: number | null; poly: number | null }
+  divergence_alerts?: DivergenceAlert[]
+  synth_forecast_iv?: number | null
 }
 
 export interface PolyPoint {
