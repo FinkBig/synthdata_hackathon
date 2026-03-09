@@ -33,6 +33,7 @@ from engine.synth_mapper import (
     compute_synth_implied_vol,
 )
 from engine.arb_scanner import run_all_strategies, build_strike_table, Signal
+from engine.poly_iv import extract_poly_iv, atm_poly_iv, PolyIVPoint
 import engine.signal_tracker as signal_tracker
 
 # Clients
@@ -568,7 +569,8 @@ async def signals_pnl():
 
 @app.get("/api/vol_surface/{asset}")
 async def vol_surface_endpoint(asset: str):
-    """Return per-expiry IV smile from Derive + SynthData ATM implied vol term structure."""
+    """Return per-expiry IV smile from Derive, SynthData term structure,
+    and Polymarket-implied vol points — the three-way vol comparison."""
     asset = asset.upper()
     if asset not in ASSETS:
         return JSONResponse({"error": f"Unknown asset: {asset}"}, status_code=400)
@@ -580,7 +582,7 @@ async def vol_surface_endpoint(asset: str):
 
     derive_surface = _build_vol_surface(chain, spot_price) if chain and spot_price > 0 else []
 
-    # SynthData implied vol at key horizons (uses 30-min cached data)
+    # SynthData: IQR-implied vol term structure + direct forecast vol
     synth_term: List[Dict] = []
     percentile_data = synth_client.get_cached_percentiles(asset)
     if percentile_data:
@@ -589,11 +591,79 @@ async def vol_surface_endpoint(asset: str):
             if iv:
                 synth_term.append({"hours_ahead": hours, "atm_iv": round(iv, 4)})
 
+    # SynthData direct forecast vol (from /insights/volatility)
+    synth_forecast_iv: Optional[float] = None
+    cached_snap = _snapshots.get(asset, {})
+    synth_forecast_iv = cached_snap.get("forecast_vol")  # already decimal
+
+    # Polymarket-implied vol: invert BSM digital prices
+    poly_points_raw = cached_snap.get("poly_points") or [
+        {**vars(m), "expiry": m.expiry.isoformat() if m.expiry else None}
+        for m in _poly_markets.get(asset, [])
+    ]
+    poly_iv_pts = extract_poly_iv(poly_points_raw, spot_price) if spot_price > 0 else []
+    poly_iv_list = [
+        {
+            "strike": p.strike,
+            "moneyness_pct": p.moneyness_pct,
+            "poly_iv": p.poly_iv,
+            "market_type": p.market_type,
+            "yes_price": p.yes_price,
+            "expiry": p.expiry,
+        }
+        for p in poly_iv_pts
+    ]
+
+    # Compute ATM IVs for divergence summary
+    atm_poly = atm_poly_iv(poly_points_raw, spot_price)
+
+    # Derive ATM IV: use nearest expiry, strike nearest to 0% moneyness
+    atm_derive: Optional[float] = None
+    if derive_surface:
+        first_exp = derive_surface[0]
+        atm_strike = min(first_exp["strikes"], key=lambda s: abs(s["moneyness_pct"]), default=None)
+        if atm_strike:
+            atm_derive = atm_strike.get("call_iv") or atm_strike.get("put_iv")
+
+    # SynthData ATM: prefer direct forecast, fall back to IQR at 8h
+    atm_synth = synth_forecast_iv
+    if not atm_synth and synth_term:
+        entry_8h = next((s for s in synth_term if s["hours_ahead"] == 8), None)
+        atm_synth = entry_8h["atm_iv"] if entry_8h else synth_term[0]["atm_iv"]
+
+    # Divergence alerts: pairs that differ by > 8 vol points
+    alerts: List[Dict] = []
+    pairs = [
+        ("Polymarket", atm_poly, "Derive", atm_derive),
+        ("Polymarket", atm_poly, "SynthData", atm_synth),
+        ("Derive", atm_derive, "SynthData", atm_synth),
+    ]
+    for a_name, a_iv, b_name, b_iv in pairs:
+        if a_iv and b_iv:
+            gap_pts = abs(a_iv - b_iv) * 100  # convert to vol points
+            if gap_pts >= 8.0:
+                alerts.append({
+                    "source_a": a_name,
+                    "iv_a": round(a_iv, 4),
+                    "source_b": b_name,
+                    "iv_b": round(b_iv, 4),
+                    "gap_vol_pts": round(gap_pts, 1),
+                    "severity": "HIGH" if gap_pts >= 15 else "MEDIUM",
+                })
+
     return {
         "asset": asset,
         "spot": spot_price,
         "derive_surface": derive_surface,
         "synth_term_structure": synth_term,
+        "synth_forecast_iv": round(synth_forecast_iv, 4) if synth_forecast_iv else None,
+        "poly_iv_points": poly_iv_list,
+        "atm_ivs": {
+            "derive": round(atm_derive, 4) if atm_derive else None,
+            "synth": round(atm_synth, 4) if atm_synth else None,
+            "poly": round(atm_poly, 4) if atm_poly else None,
+        },
+        "divergence_alerts": alerts,
     }
 
 
