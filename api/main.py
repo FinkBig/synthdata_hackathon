@@ -175,18 +175,11 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
             ratio = forecast_vol / realized_vol
             vol_regime = "expanding" if ratio > 1.5 else "compressing" if ratio < 0.7 else "stable"
 
-    # ── 4. Fetch Polymarket markets — nearest settlement date only ──
-    # SynthData gives 24h forecasts; we only compare against the single next
-    # settlement (17:00 UTC today or tomorrow). Drop all multi-day markets.
-    all_poly = await poly_client.get_all_active_markets()
+    # ── 4. Fetch Polymarket markets — query by settlement window, not volume rank ──
+    # Querying by end_date window (±1h around 17:00 UTC) ensures we get ALL
+    # above/below and range strikes, not just the top-volume subset.
     settle_dt = compute_poly_settlement_dt()
-    settle_date = settle_dt.date()
-    poly_markets = [
-        m for m in all_poly
-        if m.asset == asset
-        and m.expiry is not None
-        and m.expiry.date() == settle_date
-    ]
+    poly_markets = await poly_client.get_daily_markets(settle_dt, asset)
     _poly_markets[asset] = poly_markets
 
     # Keep CLOB subscriptions up to date after each fetch

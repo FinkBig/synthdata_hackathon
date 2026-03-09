@@ -70,16 +70,27 @@ class PolymarketClient:
             await self._session.close()
         self._session = None
 
-    async def _fetch_markets_page(self, offset: int = 0, limit: int = 100) -> List[Dict]:
+    def _is_crypto_price_market(self, question: str) -> bool:
+        q = question.lower()
+        has_asset = any(name.lower() in q for name in NAME_TO_TICKER) or any(t.lower() in q for t in POLYMARKET_ASSETS)
+        has_price_kw = any(kw in q for kw in PRICE_KEYWORDS)
+        return has_asset and has_price_kw
+
+    async def _fetch_settlement_window(
+        self, settle_dt: datetime, offset: int = 0, limit: int = 100
+    ) -> List[Dict]:
+        """Fetch markets whose end date falls within ±1h of the settlement time."""
+        from datetime import timedelta
         session = await self._ensure_session()
         url = f"{POLYMARKET_GAMMA_URL}/markets"
+        lo = (settle_dt - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        hi = (settle_dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         params: Dict[str, Any] = {
             "closed": "false",
             "limit": limit,
             "offset": offset,
-            "order": "volume24hr",
-            "ascending": "false",
-            "volume_num_min": 50,
+            "end_date_min": lo,
+            "end_date_max": hi,
         }
         try:
             async with session.get(url, params=params) as resp:
@@ -92,48 +103,47 @@ class PolymarketClient:
             logger.error("Polymarket /markets error: %s", e)
             return []
 
-    def _is_crypto_price_market(self, question: str) -> bool:
-        q = question.lower()
-        has_asset = any(name.lower() in q for name in NAME_TO_TICKER) or any(t.lower() in q for t in POLYMARKET_ASSETS)
-        has_price_kw = any(kw in q for kw in PRICE_KEYWORDS)
-        return has_asset and has_price_kw
+    async def get_daily_markets(
+        self, settle_dt: datetime, asset: Optional[str] = None
+    ) -> List["PolyMarket"]:
+        """Fetch all above/below and range markets expiring at settle_dt.
 
-    async def get_all_active_markets(self) -> List[PolyMarket]:
-        all_raw = []
-        seen_ids = set()
-        max_pages = 20
-        consecutive_empty = 0
+        Queries by settlement window (±1h) rather than volume rank, so we never
+        miss lower-volume strikes that would be buried in a volume-sorted scan.
+        """
+        seen_ids: set = set()
+        all_raw: List[Dict] = []
 
-        for page in range(max_pages):
-            offset = page * 100
-            items = await self._fetch_markets_page(offset=offset)
+        # Paginate until the API returns fewer than limit results
+        for page in range(10):
+            items = await self._fetch_settlement_window(settle_dt, offset=page * 100)
             if not items:
                 break
-
-            found_any = False
             for m in items:
                 mid = m.get("id")
-                if not mid or mid in seen_ids:
-                    continue
-                question = m.get("question", "")
-                if self._is_crypto_price_market(question):
+                if mid and mid not in seen_ids and self._is_crypto_price_market(m.get("question", "")):
                     seen_ids.add(mid)
                     all_raw.append(m)
-                    found_any = True
-
-            if not found_any:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-            else:
-                consecutive_empty = 0
-
             if len(items) < 100:
                 break
 
-        logger.info("Found %d crypto price markets from Polymarket", len(all_raw))
         parsed = [self._parse_market(raw) for raw in all_raw]
-        return [m for m in parsed if m is not None]
+        markets = [m for m in parsed if m is not None]
+
+        if asset:
+            markets = [m for m in markets if m.asset == asset]
+
+        logger.info(
+            "Polymarket daily markets for %s settle=%s: %d markets",
+            asset or "all", settle_dt.strftime("%Y-%m-%d %H:%M UTC"), len(markets),
+        )
+        return markets
+
+    async def get_all_active_markets(self) -> List["PolyMarket"]:
+        """Compatibility wrapper — fetches today's daily markets for all assets."""
+        from engine.prob_calc import compute_poly_settlement_dt
+        settle_dt = compute_poly_settlement_dt()
+        return await self.get_daily_markets(settle_dt)
 
     def get_markets_for_asset(self, markets: List[PolyMarket], asset: str) -> List[PolyMarket]:
         """Filter markets by asset ticker."""
@@ -153,7 +163,7 @@ class PolymarketClient:
 
         q_lower = question.lower()
         is_above = True
-        if "less than" in q_lower or "below" in q_lower or "dip" in q_lower:
+        if any(kw in q_lower for kw in ("less than", "below", "dip", "under")):
             is_above = False
 
         expiry = self._parse_expiration(raw.get("endDate", raw.get("end_date_iso", "")))
@@ -236,11 +246,14 @@ class PolymarketClient:
         return None
 
     def _extract_range(self, question: str):
-        match = re.search(r'between\s+\$([0-9,]+\.?[0-9]*)\s+and\s+\$([0-9,]+\.?[0-9]*)', question, re.IGNORECASE)
-        if match:
-            lower = float(match.group(1).replace(',', ''))
-            upper = float(match.group(2).replace(',', ''))
-            return lower, upper
+        # "between $X and $Y"
+        m = re.search(r'between\s+\$([0-9,]+\.?[0-9]*)\s+and\s+\$([0-9,]+\.?[0-9]*)', question, re.IGNORECASE)
+        if m:
+            return float(m.group(1).replace(',', '')), float(m.group(2).replace(',', ''))
+        # "between $X-$Y" or "$X-$Y range"
+        m = re.search(r'\$([0-9,]+\.?[0-9]*)\s*[-–]\s*\$([0-9,]+\.?[0-9]*)', question)
+        if m:
+            return float(m.group(1).replace(',', '')), float(m.group(2).replace(',', ''))
         return None, None
 
     def _classify_market(self, question: str, raw: Dict) -> str:
@@ -261,7 +274,10 @@ class PolymarketClient:
         if "up or down" in q:
             return "up_or_down"
 
-        if "above" in q:
+        if "above" in q or "greater than" in q or "more than" in q:
+            return "above_below"
+
+        if "below" in q or "less than" in q or "under" in q:
             return "above_below"
 
         if "between" in q or "range" in q:
