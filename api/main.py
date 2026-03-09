@@ -161,8 +161,12 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
     forecast_vol: Optional[float] = None
     realized_vol: Optional[float] = None
     if vol_data:
-        forecast_vol = vol_data.get("forecast_future", {}).get("average")
-        realized_vol = vol_data.get("realized", {}).get("average_volatility")
+        # SynthData returns vol in percentage points (e.g. 56.4 = 56.4% annualised)
+        # Divide by 100 for decimal form used in BSM / Kelly calculations
+        _fv = vol_data.get("forecast_future", {}).get("average_volatility")
+        _rv = vol_data.get("realized", {}).get("average_volatility")
+        forecast_vol = _fv / 100.0 if _fv else None
+        realized_vol = _rv / 100.0 if _rv else None
         if forecast_vol and realized_vol and realized_vol > 0:
             ratio = forecast_vol / realized_vol
             vol_regime = "expanding" if ratio > 1.5 else "compressing" if ratio < 0.7 else "stable"
@@ -626,8 +630,12 @@ async def risk_data(asset: str):
     realized_vol: Optional[float] = None
     vol_regime = "stable"
     if vol_data:
-        forecast_vol = vol_data.get("forecast_future", {}).get("average")
-        realized_vol = vol_data.get("realized", {}).get("average_volatility")
+        # SynthData returns vol in percentage points (e.g. 56.4 = 56.4% annualised)
+        # Divide by 100 for decimal form used in BSM / Kelly calculations
+        _fv = vol_data.get("forecast_future", {}).get("average_volatility")
+        _rv = vol_data.get("realized", {}).get("average_volatility")
+        forecast_vol = _fv / 100.0 if _fv else None
+        realized_vol = _rv / 100.0 if _rv else None
         if forecast_vol and realized_vol and realized_vol > 0:
             ratio = forecast_vol / realized_vol
             vol_regime = "expanding" if ratio > 1.5 else "compressing" if ratio < 0.7 else "stable"
