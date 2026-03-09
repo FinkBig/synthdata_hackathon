@@ -71,6 +71,15 @@ export interface PolyIVPoint {
   market_type: string
   yes_price: number
   expiry: string
+  // enriched fields from backend
+  question?: string
+  polymarket_url?: string
+  volume_24h?: number
+  clob_token_id?: string
+  derive_iv?: number | null        // variance-interpolated Derive IV at same moneyness + T_poly
+  iv_gap_pts?: number | null       // (poly_iv − derive_iv) × 100 vol points
+  derive_binary?: number | null    // BSM N(d2) using derive_iv + T_poly
+  action?: string | null           // "BUY YES" | "BUY NO" | null
 }
 
 export interface DivergenceAlert {
@@ -80,11 +89,14 @@ export interface DivergenceAlert {
   iv_b: number
   gap_vol_pts: number
   severity: 'HIGH' | 'MEDIUM'
+  higher_source?: string
+  lower_source?: string
 }
 
 export interface VolSurfaceData {
   asset: string
   spot: number
+  t_poly_hours?: number            // hours until next Poly 17:00 UTC settlement
   derive_surface: VolSurfaceExpiry[]
   synth_term_structure: SynthTermPoint[]
   poly_iv_points?: PolyIVPoint[]

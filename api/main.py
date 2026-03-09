@@ -11,6 +11,7 @@ Endpoints:
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -468,6 +469,72 @@ def _build_vol_surface(chain, spot: float) -> List[Dict]:
     return surface
 
 
+def _variance_interp_iv(points: List[tuple], t_target: float) -> Optional[float]:
+    """Interpolate/extrapolate IV to t_target (years) via linear variance.
+    points: sorted list of (tte_years, iv_decimal) pairs."""
+    if not points:
+        return None
+    if t_target <= points[0][0]:
+        return points[0][1]
+    if t_target >= points[-1][0]:
+        return points[-1][1]
+    for i in range(len(points) - 1):
+        t1, iv1 = points[i]
+        t2, iv2 = points[i + 1]
+        if t1 <= t_target <= t2:
+            var1, var2 = iv1 ** 2 * t1, iv2 ** 2 * t2
+            frac = (t_target - t1) / (t2 - t1)
+            var_t = var1 + frac * (var2 - var1)
+            return (var_t / t_target) ** 0.5 if var_t > 0 else iv1
+    return points[-1][1]
+
+
+def _derive_iv_at_strike_and_tte(
+    derive_surface: List[Dict], moneyness_pct: float, t_poly_years: float
+) -> Optional[float]:
+    """Get Derive IV at a specific moneyness, variance-interpolated to t_poly_years.
+    Linearly interpolates IV between adjacent strikes within each expiry,
+    then interpolates across expiries using linear variance (σ²T)."""
+
+    def _iv_at_mono(exp: Dict, mono: float) -> Optional[float]:
+        strikes = sorted(exp["strikes"], key=lambda s: s["moneyness_pct"])
+        if not strikes:
+            return None
+        below = [s for s in strikes if s["moneyness_pct"] <= mono]
+        above = [s for s in strikes if s["moneyness_pct"] > mono]
+        s1 = below[-1] if below else above[0]
+        s2 = above[0] if above else below[-1]
+        iv1 = (s1.get("call_iv") if mono >= 0 else s1.get("put_iv")) or s1.get("call_iv") or s1.get("put_iv")
+        iv2 = (s2.get("call_iv") if mono >= 0 else s2.get("put_iv")) or s2.get("call_iv") or s2.get("put_iv")
+        if iv1 is None:
+            return iv2
+        if iv2 is None or s1["moneyness_pct"] == s2["moneyness_pct"]:
+            return iv1
+        frac = (mono - s1["moneyness_pct"]) / (s2["moneyness_pct"] - s1["moneyness_pct"])
+        return max(0.01, iv1 + frac * (iv2 - iv1))
+
+    points = []
+    for exp in sorted(derive_surface, key=lambda e: e["tte_hours"]):
+        tte_years = exp["tte_hours"] / 8760.0
+        iv = _iv_at_mono(exp, moneyness_pct)
+        if iv and iv > 0:
+            points.append((tte_years, iv))
+
+    return _variance_interp_iv(points, t_poly_years)
+
+
+def _bsm_digital_above(spot: float, strike: float, sigma: float, tte: float) -> Optional[float]:
+    """BSM digital call price P(S_T > K) = N(d2), r=0 lognormal."""
+    if sigma <= 0 or tte <= 0 or spot <= 0 or strike <= 0:
+        return None
+    try:
+        from scipy.stats import norm
+        d2 = (math.log(spot / strike) - 0.5 * sigma ** 2 * tte) / (sigma * math.sqrt(tte))
+        return float(norm.cdf(d2))
+    except Exception:
+        return None
+
+
 def _extract_poly_edge(poly_signal_data: Optional[Dict]) -> Optional[float]:
     """Extract edge magnitude from SynthData's polymarket/up-down/daily response."""
     if not poly_signal_data:
@@ -596,34 +663,75 @@ async def vol_surface_endpoint(asset: str):
     cached_snap = _snapshots.get(asset, {})
     synth_forecast_iv = cached_snap.get("forecast_vol")  # already decimal
 
+    # Time-to-expiry to next Poly settlement (17:00 UTC) — in years
+    t_poly_years = compute_poly_settlement_tte()
+
     # Polymarket-implied vol: invert BSM digital prices
     poly_points_raw = cached_snap.get("poly_points") or [
         {**vars(m), "expiry": m.expiry.isoformat() if m.expiry else None}
         for m in _poly_markets.get(asset, [])
     ]
     poly_iv_pts = extract_poly_iv(poly_points_raw, spot_price) if spot_price > 0 else []
-    poly_iv_list = [
-        {
+
+    # Build lookup for enriching poly IV points with metadata from raw poly points
+    raw_lookup: Dict[tuple, Dict] = {}
+    for rp in poly_points_raw:
+        s = rp.get("strike") or ((rp.get("lower_bound", 0) or 0) + (rp.get("upper_bound", 0) or 0)) / 2
+        key = (round(float(s), -1), rp.get("market_type", ""), str(rp.get("expiry", ""))[:16])
+        raw_lookup[key] = rp
+
+    # Enrich each poly IV point with:
+    #   - metadata (question, url, volume, clob_token_id) from raw poly_points
+    #   - derive_iv: variance-interpolated to T_poly at same moneyness
+    #   - derive_binary: BSM N(d2) using derive_iv + T_poly for direct price comparison
+    #   - iv_gap_pts: (poly_iv − derive_iv) × 100
+    #   - action: trade implication from price comparison (BUY YES / BUY NO)
+    poly_iv_list: List[Dict] = []
+    for p in poly_iv_pts:
+        key = (round(p.strike, -1), p.market_type, p.expiry[:16])
+        raw = raw_lookup.get(key, {})
+
+        # Derive IV at this strike's moneyness, variance-interpolated to T_poly
+        d_iv = _derive_iv_at_strike_and_tte(derive_surface, p.moneyness_pct, t_poly_years)
+
+        # BSM binary price comparison (above_below only — range is more complex)
+        derive_binary: Optional[float] = None
+        action: Optional[str] = None
+        if d_iv and p.market_type == "above_below":
+            is_above = raw.get("is_above", True)
+            db = _bsm_digital_above(spot_price, p.strike, d_iv, t_poly_years)
+            if db is not None:
+                derive_binary = db if is_above else (1.0 - db)
+                price_gap = p.yes_price - derive_binary
+                if price_gap > 0.03:
+                    action = "BUY NO"
+                elif price_gap < -0.03:
+                    action = "BUY YES"
+
+        iv_gap_pts = round((p.poly_iv - d_iv) * 100, 1) if d_iv else None
+
+        poly_iv_list.append({
             "strike": p.strike,
             "moneyness_pct": p.moneyness_pct,
             "poly_iv": p.poly_iv,
             "market_type": p.market_type,
             "yes_price": p.yes_price,
             "expiry": p.expiry,
-        }
-        for p in poly_iv_pts
-    ]
+            "question": raw.get("question", ""),
+            "polymarket_url": raw.get("polymarket_url", ""),
+            "volume_24h": raw.get("volume_24h"),
+            "clob_token_id": raw.get("clob_token_id"),
+            "derive_iv": round(d_iv, 4) if d_iv else None,
+            "iv_gap_pts": iv_gap_pts,
+            "derive_binary": round(derive_binary, 4) if derive_binary is not None else None,
+            "action": action,
+        })
 
-    # Compute ATM IVs for divergence summary
+    # ATM IVs for headline comparison
     atm_poly = atm_poly_iv(poly_points_raw, spot_price)
 
-    # Derive ATM IV: use nearest expiry, strike nearest to 0% moneyness
-    atm_derive: Optional[float] = None
-    if derive_surface:
-        first_exp = derive_surface[0]
-        atm_strike = min(first_exp["strikes"], key=lambda s: abs(s["moneyness_pct"]), default=None)
-        if atm_strike:
-            atm_derive = atm_strike.get("call_iv") or atm_strike.get("put_iv")
+    # Derive ATM IV — variance-interpolated to T_poly (the TTE fix)
+    atm_derive = _derive_iv_at_strike_and_tte(derive_surface, 0.0, t_poly_years)
 
     # SynthData ATM: prefer direct forecast, fall back to IQR at 8h
     atm_synth = synth_forecast_iv
@@ -631,17 +739,18 @@ async def vol_surface_endpoint(asset: str):
         entry_8h = next((s for s in synth_term if s["hours_ahead"] == 8), None)
         atm_synth = entry_8h["atm_iv"] if entry_8h else synth_term[0]["atm_iv"]
 
-    # Divergence alerts: pairs that differ by > 8 vol points
+    # Divergence alerts: pairs that differ by ≥ 8 vol points at ATM
     alerts: List[Dict] = []
-    pairs = [
+    _alert_pairs = [
         ("Polymarket", atm_poly, "Derive", atm_derive),
         ("Polymarket", atm_poly, "SynthData", atm_synth),
         ("Derive", atm_derive, "SynthData", atm_synth),
     ]
-    for a_name, a_iv, b_name, b_iv in pairs:
+    for a_name, a_iv, b_name, b_iv in _alert_pairs:
         if a_iv and b_iv:
-            gap_pts = abs(a_iv - b_iv) * 100  # convert to vol points
+            gap_pts = abs(a_iv - b_iv) * 100
             if gap_pts >= 8.0:
+                higher, lower = (a_name, b_name) if a_iv > b_iv else (b_name, a_name)
                 alerts.append({
                     "source_a": a_name,
                     "iv_a": round(a_iv, 4),
@@ -649,11 +758,14 @@ async def vol_surface_endpoint(asset: str):
                     "iv_b": round(b_iv, 4),
                     "gap_vol_pts": round(gap_pts, 1),
                     "severity": "HIGH" if gap_pts >= 15 else "MEDIUM",
+                    "higher_source": higher,
+                    "lower_source": lower,
                 })
 
     return {
         "asset": asset,
         "spot": spot_price,
+        "t_poly_hours": round(t_poly_years * 8760, 2),
         "derive_surface": derive_surface,
         "synth_term_structure": synth_term,
         "synth_forecast_iv": round(synth_forecast_iv, 4) if synth_forecast_iv else None,
