@@ -25,6 +25,7 @@ SYNTHDATA_BASE_URL = "https://api.synthdata.co"
 SYNTHDATA_CREDIT_BUDGET = 18_983   # remaining credits as of project start
 SYNTHDATA_CREDIT_WARN_AT = 2_000   # log warning when below this
 SYNTHDATA_402_BACKOFF_SEC = 3600
+SYNTHDATA_429_BACKOFF_SEC = 300  # 5 min back-off per endpoint on rate-limit
 MIN_TTL = 300  # no endpoint may cache for less than 5 minutes
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,8 @@ class SynthDataClient:
 
         self.last_error: Optional[str] = None
         self.enabled = bool(self._api_key)
-        self._disabled_until: float = 0.0
+        self._disabled_until: float = 0.0          # global 402 backoff
+        self._endpoint_disabled: Dict[str, float] = {}  # per-endpoint 429 backoff
 
     def in_backoff(self) -> bool:
         return time.time() < self._disabled_until
@@ -98,8 +100,15 @@ class SynthDataClient:
         if self._is_cached(cache_key, ttl):
             return self._cache[cache_key]
 
-        if time.time() < self._disabled_until:
+        now = time.time()
+
+        # Global 402 backoff (credit exhaustion)
+        if now < self._disabled_until:
             self.last_error = "402 backoff (insufficient credits)"
+            return self._cache.get(cache_key)
+
+        # Per-endpoint 429 backoff (rate limit)
+        if now < self._endpoint_disabled.get(cache_key, 0):
             return self._cache.get(cache_key)
 
         if not self._check_budget():
@@ -115,6 +124,12 @@ class SynthDataClient:
                     logger.warning("SynthData 402 — pausing %d min. %d credits used so far.",
                                    SYNTHDATA_402_BACKOFF_SEC // 60, self._call_count)
                     self.last_error = "402 Insufficient credits (backoff)"
+                    return self._cache.get(cache_key)
+                if resp.status == 429:
+                    self._endpoint_disabled[cache_key] = time.time() + SYNTHDATA_429_BACKOFF_SEC
+                    logger.warning("SynthData 429 rate limit on %s — backing off %ds",
+                                   endpoint, SYNTHDATA_429_BACKOFF_SEC)
+                    self.last_error = "429 rate limit"
                     return self._cache.get(cache_key)
                 if resp.status != 200:
                     text = await resp.text()

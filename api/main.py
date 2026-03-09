@@ -135,25 +135,27 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
         logger.warning("No live data for %s — falling back to mock", asset)
         return _load_mock(asset)
 
-    # ── 3. Fetch all SynthData endpoints in parallel ──
-    _sd_results = await asyncio.gather(
-        synth_client.get_prediction_percentiles(asset),
-        synth_client.get_volatility(asset),
-        synth_client.get_lp_probabilities(asset),
-        synth_client.get_lp_bounds(asset),
-        synth_client.get_liquidation(asset),
-        synth_client.get_polymarket_signal(asset),
-        return_exceptions=True,
-    )
+    # ── 3. Fetch all SynthData endpoints ──
+    # Split into two staggered batches to stay within SynthData's rate limit.
+    # Batch A: high-priority (short TTL, needed for prob curves + signals)
+    # Batch B: risk layer (longer TTL, served from cache on subsequent calls)
     def _ok(v):
         return v if v is not None and not isinstance(v, Exception) else None
 
-    percentile_data  = _ok(_sd_results[0])
-    vol_data         = _ok(_sd_results[1])
-    lp_probs_data    = _ok(_sd_results[2])
-    lp_bounds_data   = _ok(_sd_results[3])
-    liq_data         = _ok(_sd_results[4])
-    poly_signal_data = _ok(_sd_results[5])
+    # Fetch sequentially with 1s gaps — SynthData rate-limits burst requests.
+    # After the first fetch each endpoint is cached (TTL 10min–2h) so
+    # subsequent calls are free (no network, no credit spend).
+    percentile_data  = _ok(await synth_client.get_prediction_percentiles(asset))
+    await asyncio.sleep(1.0)
+    vol_data         = _ok(await synth_client.get_volatility(asset))
+    await asyncio.sleep(1.0)
+    poly_signal_data = _ok(await synth_client.get_polymarket_signal(asset))
+    await asyncio.sleep(1.0)
+    lp_probs_data    = _ok(await synth_client.get_lp_probabilities(asset))
+    await asyncio.sleep(1.0)
+    lp_bounds_data   = _ok(await synth_client.get_lp_bounds(asset))
+    await asyncio.sleep(1.0)
+    liq_data         = _ok(await synth_client.get_liquidation(asset))
     has_synth = percentile_data is not None
 
     # Derive vol regime from SynthData volatility
