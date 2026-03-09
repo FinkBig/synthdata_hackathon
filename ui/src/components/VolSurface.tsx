@@ -129,6 +129,22 @@ function ActionBadge({ action }: { action: string | null | undefined }) {
 
 function VisualizationsTab({ data }: { data: VolSurfaceData }) {
   const [chartView, setChartView] = useState<ChartView>('iv_compare')
+  const [selectedExpiries, setSelectedExpiries] = useState<Set<number>>(
+    () => new Set(data.derive_surface.map((_, i) => i))
+  )
+
+  // Reset selection when asset/surface changes
+  useEffect(() => {
+    setSelectedExpiries(new Set(data.derive_surface.map((_, i) => i)))
+  }, [data.asset, data.derive_surface.length])
+
+  function toggleExpiry(i: number) {
+    setSelectedExpiries(prev => {
+      const next = new Set(prev)
+      next.has(i) ? next.delete(i) : next.add(i)
+      return next
+    })
+  }
 
   const surface = data.derive_surface
   const polyPoints = data.poly_iv_points ?? []
@@ -214,15 +230,23 @@ function VisualizationsTab({ data }: { data: VolSurfaceData }) {
         <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
           <h3 className="text-sm font-semibold text-slate-300 mb-1">Three-Way Implied Volatility — {data.asset}</h3>
           <p className="text-xs text-slate-500 mb-3">Derive smile (colored lines) · SynthData forecast (white dashed) · Poly-implied IV (purple dots) · Derive IV variance-adjusted to T_poly</p>
-          <div className="flex flex-wrap gap-4 mb-4 text-xs">
-            {surface.slice(0, 4).map((exp, i) => (
-              <div key={exp.expiry} className="flex items-center gap-1.5">
-                <span className="w-5 h-0.5 rounded inline-block" style={{ background: EXPIRY_COLOURS[i] }} />
-                <span className="text-slate-400">{exp.label}</span>
-              </div>
-            ))}
+          <div className="flex flex-wrap gap-2 mb-4 text-xs items-center">
+            {surface.map((exp, i) => {
+              const on = selectedExpiries.has(i)
+              return (
+                <button key={exp.expiry} onClick={() => toggleExpiry(i)}
+                  className={`flex items-center gap-1.5 px-2 py-1 rounded-md border transition-all ${on ? 'border-slate-600 opacity-100' : 'border-slate-800 opacity-35'}`}>
+                  <span className="w-4 h-0.5 rounded inline-block" style={{ background: EXPIRY_COLOURS[i % EXPIRY_COLOURS.length] }} />
+                  <span className={on ? 'text-slate-300' : 'text-slate-600'}>{exp.label}</span>
+                </button>
+              )
+            })}
+            <button onClick={() => setSelectedExpiries(new Set(surface.map((_, i) => i)))}
+              className="text-slate-600 hover:text-slate-400 px-1 transition-colors">all</button>
+            <button onClick={() => setSelectedExpiries(new Set())}
+              className="text-slate-600 hover:text-slate-400 px-1 transition-colors">none</button>
             {synthForecastIV != null && (
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 ml-2">
                 <span className="inline-block w-5 border-t-2 border-dashed border-slate-300" style={{ marginTop: 1 }} />
                 <span className="text-slate-300">SynthData {(synthForecastIV * 100).toFixed(0)}%</span>
               </div>
@@ -244,7 +268,7 @@ function VisualizationsTab({ data }: { data: VolSurfaceData }) {
               {synthForecastIV != null && (
                 <ReferenceLine y={+(synthForecastIV * 100).toFixed(1)} stroke="#e2e8f0" strokeDasharray="8 4" strokeWidth={1.5} label={{ value: `SynthData ${(synthForecastIV * 100).toFixed(0)}%`, fill: '#94a3b8', fontSize: 10, position: 'insideTopRight' }} />
               )}
-              {surface.map((exp, i) => (
+              {surface.map((exp, i) => selectedExpiries.has(i) && (
                 <Line key={exp.expiry} type="monotone" dataKey={`exp_${i}`} name={exp.label} stroke={EXPIRY_COLOURS[i % EXPIRY_COLOURS.length]} strokeWidth={2} dot={false} connectNulls />
               ))}
               {polyPoints.length > 0 && (
@@ -259,13 +283,21 @@ function VisualizationsTab({ data }: { data: VolSurfaceData }) {
       {chartView === 'smile' && (
         <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
           <h3 className="text-sm font-semibold text-slate-300 mb-3">IV Smile — {data.asset} · OTM calls (right) / puts (left)</h3>
-          <div className="flex flex-wrap gap-3 mb-4">
-            {surface.map((exp, i) => (
-              <div key={exp.expiry} className="flex items-center gap-1.5 text-xs">
-                <span className="w-3 h-0.5 rounded inline-block" style={{ background: EXPIRY_COLOURS[i % EXPIRY_COLOURS.length] }} />
-                <span className="text-slate-400">{exp.label}</span>
-              </div>
-            ))}
+          <div className="flex flex-wrap gap-2 mb-4 items-center">
+            {surface.map((exp, i) => {
+              const on = selectedExpiries.has(i)
+              return (
+                <button key={exp.expiry} onClick={() => toggleExpiry(i)}
+                  className={`flex items-center gap-1.5 px-2 py-1 rounded-md border text-xs transition-all ${on ? 'border-slate-600 opacity-100' : 'border-slate-800 opacity-35'}`}>
+                  <span className="w-4 h-0.5 rounded inline-block" style={{ background: EXPIRY_COLOURS[i % EXPIRY_COLOURS.length] }} />
+                  <span className={on ? 'text-slate-300' : 'text-slate-600'}>{exp.label}</span>
+                </button>
+              )
+            })}
+            <button onClick={() => setSelectedExpiries(new Set(surface.map((_, i) => i)))}
+              className="text-xs text-slate-600 hover:text-slate-400 px-1 transition-colors">all</button>
+            <button onClick={() => setSelectedExpiries(new Set())}
+              className="text-xs text-slate-600 hover:text-slate-400 px-1 transition-colors">none</button>
           </div>
           <ResponsiveContainer width="100%" height={320}>
             <ComposedChart data={smileData} margin={{ top: 10, right: 20, left: 10, bottom: 10 }}>
@@ -274,7 +306,7 @@ function VisualizationsTab({ data }: { data: VolSurfaceData }) {
               <YAxis tickFormatter={(v) => `${v}%`} tick={{ fill: '#64748b', fontSize: 11 }} axisLine={{ stroke: '#334155' }} tickLine={false} width={40} />
               <Tooltip content={<SmileTooltip />} />
               <ReferenceLine x={0} stroke="#475569" strokeDasharray="6 3" label={{ value: 'ATM', fill: '#64748b', fontSize: 10 }} />
-              {surface.map((exp, i) => (
+              {surface.map((exp, i) => selectedExpiries.has(i) && (
                 <Line key={exp.expiry} type="monotone" dataKey={`exp_${i}`} name={exp.label} stroke={EXPIRY_COLOURS[i % EXPIRY_COLOURS.length]} strokeWidth={2} dot={false} connectNulls />
               ))}
             </ComposedChart>
