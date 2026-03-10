@@ -43,6 +43,7 @@ from clients.derive import DeriveClient
 from clients.polymarket import PolymarketClient
 from clients.polymarket_clob import PolymarketClobWs
 from clients.synthdata import SynthDataClient
+import clients.poly_clob_rest as poly_clob_rest
 
 logger = logging.getLogger(__name__)
 
@@ -1091,6 +1092,50 @@ def _mock_options_chain(asset: str) -> Dict:
             "rows": rows,
         })
     return {"asset": asset, "spot": spot, "expiries": expiry_blocks}
+
+
+@app.get("/api/poly/orderbook/{token_id}")
+async def poly_orderbook(token_id: str):
+    """Full order book depth for a single Polymarket CLOB token (via py-clob-client REST).
+    Returns top-10 bid/ask levels, spread, and midpoint. No auth required."""
+    loop = asyncio.get_event_loop()
+    book = await loop.run_in_executor(None, poly_clob_rest.get_order_book, token_id)
+    return book
+
+
+@app.get("/api/poly/midpoints/{asset}")
+async def poly_midpoints(asset: str):
+    """Batch midpoint prices for all Polymarket tokens of an asset (REST, lighter than full books).
+    Complements the WebSocket live prices with a REST fallback."""
+    asset = asset.upper()
+    if asset not in ASSETS:
+        return JSONResponse({"error": f"Unknown asset: {asset}"}, status_code=400)
+
+    markets = _poly_markets.get(asset, [])
+    token_ids = [m.clob_token_id for m in markets if m.clob_token_id]
+    if not token_ids:
+        return {"asset": asset, "midpoints": {}, "source": "rest"}
+
+    loop = asyncio.get_event_loop()
+    mids = await loop.run_in_executor(None, poly_clob_rest.get_midpoints_batch, token_ids)
+
+    # Annotate with question/strike metadata
+    token_meta = {m.clob_token_id: m for m in markets if m.clob_token_id}
+    result = {}
+    for tid, mid in mids.items():
+        m = token_meta.get(tid)
+        result[tid] = {
+            "mid": mid,
+            "question": m.question if m else None,
+            "strike": m.strike if m else None,
+        }
+
+    return {
+        "asset": asset,
+        "midpoints": result,
+        "source": "rest",
+        "sdk_available": poly_clob_rest.is_available(),
+    }
 
 
 @app.get("/api/stream")

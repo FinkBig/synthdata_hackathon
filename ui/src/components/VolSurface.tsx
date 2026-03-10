@@ -9,7 +9,7 @@ import {
   ReferenceLine,
   ResponsiveContainer,
 } from 'recharts'
-import { VolSurfaceData, VolSurfaceExpiry, PolyIVPoint, DivergenceAlert } from '../types'
+import { VolSurfaceData, VolSurfaceExpiry, PolyIVPoint, DivergenceAlert, OrderBook } from '../types'
 
 interface Props { asset: string }
 
@@ -379,6 +379,74 @@ function VisualizationsTab({ data }: { data: VolSurfaceData }) {
   )
 }
 
+// ── Order Book Panel ──────────────────────────────────────────────────────────
+
+function OrderBookPanel({ tokenId, onClose }: { tokenId: string; onClose: () => void }) {
+  const [book, setBook] = useState<OrderBook | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    setLoading(true)
+    fetch(`/api/poly/orderbook/${tokenId}`)
+      .then(r => r.json())
+      .then(d => { setBook(d); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [tokenId])
+
+  const maxSize = book
+    ? Math.max(...[...book.bids, ...book.asks].map(l => l.size), 0.01)
+    : 1
+
+  return (
+    <div className="bg-slate-800 border border-slate-700 rounded-xl p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm font-semibold text-slate-200">Order Book</p>
+          {book?.midpoint != null && (
+            <p className="text-xs text-slate-400 font-mono">
+              Mid: <span className="text-white">{(book.midpoint * 100).toFixed(1)}¢</span>
+              {book.spread != null && <span className="text-slate-500 ml-2">Spread: {(book.spread * 100).toFixed(1)}¢</span>}
+            </p>
+          )}
+        </div>
+        <button onClick={onClose} className="text-slate-500 hover:text-slate-300 text-lg leading-none">×</button>
+      </div>
+
+      {loading ? (
+        <p className="text-xs text-slate-500 py-2">Loading…</p>
+      ) : book?.error ? (
+        <p className="text-xs text-red-400">Error: {book.error}</p>
+      ) : (
+        <div className="grid grid-cols-2 gap-3 text-xs">
+          {/* Bids */}
+          <div>
+            <p className="text-green-400 font-semibold mb-1.5">Bids (YES)</p>
+            {book!.bids.length === 0 ? <p className="text-slate-600">—</p> : book!.bids.map((lvl, i) => (
+              <div key={i} className="flex items-center gap-2 mb-0.5">
+                <div className="h-3 bg-green-500/20 rounded-sm" style={{ width: `${(lvl.size / maxSize) * 80}px` }} />
+                <span className="font-mono text-green-300 w-10 text-right">{(lvl.price * 100).toFixed(1)}¢</span>
+                <span className="font-mono text-slate-500 w-12 text-right">{lvl.size.toFixed(0)}</span>
+              </div>
+            ))}
+          </div>
+          {/* Asks */}
+          <div>
+            <p className="text-red-400 font-semibold mb-1.5">Asks (YES)</p>
+            {book!.asks.length === 0 ? <p className="text-slate-600">—</p> : book!.asks.map((lvl, i) => (
+              <div key={i} className="flex items-center gap-2 mb-0.5">
+                <div className="h-3 bg-red-500/20 rounded-sm" style={{ width: `${(lvl.size / maxSize) * 80}px` }} />
+                <span className="font-mono text-red-300 w-10 text-right">{(lvl.price * 100).toFixed(1)}¢</span>
+                <span className="font-mono text-slate-500 w-12 text-right">{lvl.size.toFixed(0)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {book?.tick_size && <p className="text-xs text-slate-600">Tick size: {book.tick_size}</p>}
+    </div>
+  )
+}
+
 // ── Markets Tab ───────────────────────────────────────────────────────────────
 
 function MarketsTab({ data }: { data: VolSurfaceData }) {
@@ -387,6 +455,7 @@ function MarketsTab({ data }: { data: VolSurfaceData }) {
   const [gapFilter, setGapFilter] = useState<'all' | '5' | '10' | '15'>('all')
   const [sortKey, setSortKey] = useState<SortKey>('iv_gap_pts')
   const [sortAsc, setSortAsc] = useState(false)
+  const [selectedToken, setSelectedToken] = useState<string | null>(null)
 
   const polyPoints = data.poly_iv_points ?? []
 
@@ -465,6 +534,11 @@ function MarketsTab({ data }: { data: VolSurfaceData }) {
         <span className="text-xs text-slate-500">{filtered.length} markets</span>
       </div>
 
+      {/* Order book panel */}
+      {selectedToken && (
+        <OrderBookPanel tokenId={selectedToken} onClose={() => setSelectedToken(null)} />
+      )}
+
       {/* Markets table */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
         <div className="overflow-x-auto">
@@ -492,7 +566,10 @@ function MarketsTab({ data }: { data: VolSurfaceData }) {
                 const gapAbs = p.iv_gap_pts != null ? Math.abs(p.iv_gap_pts) : 0
                 const rowHighlight = gapAbs >= 15 ? 'border-l-2 border-red-500/50' : gapAbs >= 8 ? 'border-l-2 border-yellow-500/50' : ''
                 return (
-                  <tr key={i} className={`border-b border-slate-800/50 hover:bg-slate-800/30 ${rowHighlight}`}>
+                  <tr key={i}
+                    className={`border-b border-slate-800/50 hover:bg-slate-800/30 cursor-pointer ${rowHighlight} ${p.clob_token_id && selectedToken === p.clob_token_id ? 'bg-slate-800/50' : ''}`}
+                    onClick={() => p.clob_token_id && setSelectedToken(prev => prev === p.clob_token_id ? null : p.clob_token_id!)}
+                  >
                     <td className="px-4 py-2.5">
                       <p className="text-slate-200 leading-tight truncate max-w-xs" title={p.question}>{p.question || '—'}</p>
                       <p className="text-slate-500 font-mono mt-0.5">{p.moneyness_pct >= 0 ? '+' : ''}{p.moneyness_pct.toFixed(1)}% OTM</p>

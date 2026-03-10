@@ -123,6 +123,22 @@ export interface PolyPoint {
   expiry?: string
 }
 
+export interface OrderBookLevel {
+  price: number
+  size: number
+}
+
+export interface OrderBook {
+  token_id: string
+  bids: OrderBookLevel[]
+  asks: OrderBookLevel[]
+  spread: number | null
+  midpoint: number | null
+  tick_size: string | null
+  timestamp: string | null
+  error?: string
+}
+
 export interface OptionsChainRow {
   strike: number
   moneyness_pct: number
