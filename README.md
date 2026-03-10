@@ -1,284 +1,237 @@
 # Synth-Vol Triangulator
 
-**Three-way BTC/ETH volatility arbitrage dashboard** — triangulates real-time probability estimates from three independent sources to surface 0DTE/24h mispricing signals.
+**Three-way implied volatility comparison across SynthData AI, Derive options, and Polymarket prediction markets — with live arbitrage signal detection.**
+
+Built for the [SynthData Predictive Intelligence Hackathon](https://synthdata.co/hackathon) — targeting Best Options Tool and Best Prediction Markets Tool categories.
 
 ```
 SynthData AI  ──┐
-                ├──▶  DVM Triangulator  ──▶  Arb Signals  ──▶  React Dashboard
+                ├──▶  Three-Way IV Engine  ──▶  Arb Signals  ──▶  React Dashboard
 Derive Options ─┤
-                │
-Polymarket ─────┘  (live CLOB bid/ask via WebSocket)
+Polymarket ─────┘  (live CLOB WebSocket + REST order book depth)
 ```
-
-Built for the [SynthData AI](https://synthdata.co) hackathon.
 
 ---
 
-## What it does
+## The Novel Contribution
 
-The three probability sources each model P(S_T > K) independently. When they disagree by more than 3%, that's a tradeable edge:
+**Polymarket → Implied Volatility** has not been done before.
 
-| Source | Method | Latency |
+Polymarket YES prices are digital option prices: `P(S_T > K)` for above/below markets, `P(K_lo < S_T < K_hi)` for range markets. By inverting the Black-Scholes digital option formula, we extract the crowd's *implied volatility* at each strike via `scipy.optimize.brentq`. This makes Polymarket prices directly comparable to options market IVs — on the same axis, in the same units.
+
+When three independent markets (AI forecast + options + prediction market) price the same event differently, the divergence is a tradeable edge.
+
+---
+
+## What It Does
+
+### Three probability sources
+
+| Source | What it represents | How we extract IV |
 |---|---|---|
-| **SynthData AI** | Monotone cubic spline on 9 percentile-price pairs from `/prediction-percentiles` | Per-request |
-| **Derive / Lyra Finance** | Discrete Vertical Mapping on the live options chain | Per-request |
-| **Polymarket** | Binary prediction market mid prices (live CLOB WebSocket) | 5s refresh |
+| **SynthData** | AI probabilistic price forecast | IQR-implied vol from `/prediction-percentiles` percentile CDF |
+| **Derive (Lyra Finance)** | Options market consensus | IV smile from full options chain, variance-interpolated to Poly TTE |
+| **Polymarket** | Crowd-priced binary predictions | BSM inversion — convert YES/NO prices to implied vol via `brentq` |
+
+### Four views
+
+**Dashboard** — Core arb scanner:
+- Probability curves: SynthData AI (white) vs Derive DVM (orange) vs Polymarket CLOB (blue), live-updated via WebSocket
+- Arbitrage signal cards: confidence badge (HIGH ≥10% / MEDIUM ≥6% / LOW ≥3%), Kelly fraction, BSM delta, vega
+- Strike-by-strike comparison table (highlighted rows = actionable edge ≥ 3%)
+- Full Polymarket markets panel: question title, strike/range, TTE, YES/NO bid/ask spread, 24h volume
+
+**Vol Surface** — IV comparison across expiries:
+- *Visualizations tab*: ATM IV cards for all three sources + divergence alerts + IV smile chart (Poly IV dots overlaid on Derive lines) + term structure + skew snapshot. Expiry toggles isolate individual Derive expiries.
+- *Markets tab*: per-market table split into Above/Below vs Range sub-views, sortable by IV gap, volume, moneyness. Click any row → live order book depth panel (top-10 bid/ask levels via py-clob-client REST).
+
+**Options Chain** — Multi-expiry Derive bid/ask vs AI vs Polymarket:
+- Real bid/ask prices (not mids) for every Derive strike across all expiries
+- Correctly matched to the corresponding Polymarket settlement: for Derive expiry date D, Poly settlement = **(D−1) at 17:00 UTC** (Derive expires 08:00 UTC, Poly settles the evening before)
+- Per-strike: Call/Put bid|ask|IV · SynthData P(S>K) · Derive BSM N(d2) · Polymarket YES price · Edge
+- BUY YES / BUY NO action labels, highlighted rows when |edge| ≥ 4%
+
+**Signal History** — SQLite-backed signal log with settlement tracking and P&L by strategy.
 
 ---
 
 ## Quickstart
 
-### Demo mode — no API keys needed
-
 ```bash
-# Backend (port 8000)
-MOCK_MODE=1 python run.py
+# 1. Clone
+git clone https://github.com/FinkBig/synthdata_hackathon
+cd synthdata_hackathon
 
-# Frontend (port 5173, separate terminal)
+# 2. Backend dependencies
+pip install -r requirements.txt
+
+# 3. Add your SynthData key
+cp .env.example .env
+# Edit .env: SYNTHDATA_API_KEY=your_key
+
+# 4. Start backend  →  http://localhost:8000
+python run.py
+
+# 5. Start frontend  →  http://localhost:5173  (separate terminal)
 cd ui && npm install && npm run dev
+
+# Demo mode — no API keys needed
+MOCK_MODE=1 python run.py
 ```
 
-Open **http://localhost:5173** — pre-computed BTC short-vol and ETH skew-arb scenarios with signal cards.
-
-### Live mode
-
-Only one key is needed — Binance and Polymarket are fully public APIs.
-
-```bash
-export SYNTHDATA_API_KEY=your_key_here
-
-python run.py          # backend :8000
-cd ui && npm run dev   # frontend :5173
-```
-
-On startup the backend will log:
-```
-CLOB WS: connected
-CLOB WS: subscribed to N token IDs
-Binance BTC spot: 69,xxx
-Derive BTC: 208 options fetched
-Found N crypto price markets from Polymarket
-```
+Only `SYNTHDATA_API_KEY` is required. Binance, Derive, and Polymarket are all public APIs.
 
 ---
 
 ## Architecture
 
 ```
-hackathon/
-├── config.py                    # Standalone constants, no parent deps
-├── run.py                       # Uvicorn entry point
-├── requirements.txt
-│
-├── clients/
-│   ├── binance.py               # Spot price (BTCUSDT / ETHUSDT)
-│   ├── derive.py                # Lyra Finance options chain (all expiries)
-│   ├── polymarket.py            # Gamma REST API — market discovery & parsing
-│   ├── polymarket_clob.py       # CLOB WebSocket — live bid/ask prices
-│   └── synthdata.py             # /prediction-percentiles (289 steps × 9 quantiles)
-│
-├── engine/
-│   ├── prob_calc.py             # Discrete Vertical Mapping (DVM) + variance interp
-│   ├── synth_mapper.py          # Percentile CDF → P(S>K) via PchipInterpolator
-│   └── arb_scanner.py           # Three strategies: short_vol, skew_arb, the_pin
-│
-├── api/
-│   └── main.py                  # FastAPI: snapshot, signals, SSE, poly live
-│
-├── ui/
-│   └── src/
-│       ├── App.tsx              # Asset tabs, 60s snapshot poll, 5s CLOB poll
-│       └── components/
-│           ├── Dashboard.tsx    # Stats, legend (● LIVE), chart, signals, table
-│           ├── ProbChart.tsx    # Three overlaid curves + live Poly dots
-│           ├── SignalCard.tsx   # Signal display with confidence badge
-│           └── StrikeTable.tsx  # Per-strike comparison table
-│
-└── data/mock/
-    ├── btc_snapshot.json        # BTC $95,200 short-vol scenario
-    └── eth_snapshot.json        # ETH $3,420 skew-arb scenario
+Binance REST ──────────────────────────────────────────────────┐
+Derive REST (Lyra Finance) ────────────────────────────────────┤
+SynthData API (6 endpoints) ───────────────────────────────────┼──▶ _fetch_live_snapshot()
+Polymarket Gamma REST (settlement window query) ───────────────┤         │
+Polymarket CLOB WebSocket (live bid/ask streaming) ────────────┘         ▼
+py-clob-client REST (order book depth) ──────────────────────────▶  FastAPI endpoints
 ```
 
----
+### Engine (`engine/`)
 
-## Core Math
-
-### Discrete Vertical Mapping (DVM)
-
-Breeden-Litzenberger requires a **continuous, smooth options surface**. For 0DTE/24h expiries:
-- Strike spacing is wide relative to remaining variance
-- Wide bid-ask spreads make the second derivative of call prices extremely noisy
-- BL produces negative or nonsensical probabilities at many strikes
-
-**DVM** uses adjacent call (or put) spreads directly — the exact finite-difference analogue of BL, but numerically stable for sparse chains:
+**Discrete Vertical Mapping (DVM)** — not Breeden-Litzenberger:
 
 ```
-For calls above spot:
-  P(K₁ < S_T < K₂) = (C(K₁).mid − C(K₂).mid) / (K₂ − K₁)
-
-For puts below spot:
-  P(K₁ < S_T < K₂) = (P(K₂).mid − P(K₁).mid) / (K₂ − K₁)
+P(K₁ < S_T < K₂) = (C(K₁).mid − C(K₂).mid) / (K₂ − K₁)
 ```
 
-The full `P(S > K)` curve is built by summing range probabilities from the outer strikes inward, anchored at `P(S > spot) ≈ 0.5`.
+BL requires a dense, smooth surface. 0DTE chains are too sparse — DVM finite-differencing between adjacent mid prices is more robust and produces no negative probabilities.
 
-### Variance Interpolation (Expiry Gap Adjustment)
-
-Derive options expire at **08:00 UTC**; Polymarket settles at **17:00 UTC**. Raw 08:00 option prices underestimate the variance for a 17:00 comparison. We interpolate **total variance** (not raw IV) across two bracket expiries:
+**Variance interpolation for TTE alignment** — Derive expires 08:00 UTC, Poly settles 17:00 UTC. We compute σ at exactly T_poly:
 
 ```
-σ²_poly × T_poly = σ²_1 × T_1 + frac × (σ²_2 × T_2 − σ²_1 × T_1)
-
-where frac = (T_poly − T_1) / (T_2 − T_1)
+σ²(T_poly) × T_poly = σ²(T₁)×T₁ + frac × (σ²(T₂)×T₂ − σ²(T₁)×T₁)
 ```
 
-This correctly scales the DVM probabilities to the Polymarket settlement time, rather than naively using the nearest expiry.
-
-### SynthData Percentile Reconstruction
-
-`/prediction-percentiles` returns **289 time steps** (5-min intervals over 24h), each with **9 quantile-price pairs**:
-
-```json
-{"0.005": 84200, "0.05": 85100, "0.2": 86400, ..., "0.995": 98500}
-```
-
-This is a discrete inverse CDF: `Q(p) = price`, so `P(S < price) = p`.
-
-Algorithm:
-1. Select the time step closest to the Polymarket settlement horizon
-2. Extract the 9 `(probability, price)` pairs
-3. Fit a **monotone cubic spline** (`PchipInterpolator`) — no overshoot, well-behaved between nodes
-4. Evaluate `P(S < K)` at each strike in the grid; return `P(S > K) = 1 − P(S < K)`
-5. Clamp extrapolation at the 0.5th and 99.5th percentile boundaries (cubic extrapolation inverts outside the data range)
-
----
-
-## Three Arbitrage Strategies
-
-### Strategy 1 — Short Vol
+**SynthData percentile reconstruction** — `/prediction-percentiles` returns 9 quantile-price pairs at 289 time steps. We select the step matching T_poly, fit a `PchipInterpolator` (monotone cubic spline), and evaluate P(S>K) across the strike grid. IQR-implied vol:
 
 ```
-Condition: synth_prob < derive_prob < poly_prob
-           AND (poly_prob − synth_prob) > 3%
-
-Action:    SELL POLY YES / SELL CALL SPREAD
+σ_synth = log(Q75/Q25) / (2 × 0.6745 × √T)
 ```
 
-Both AI and options price the event lower than Polymarket. Polymarket is overpriced. Sell the Poly YES binary and hedge with a short call spread on Derive.
+**BSM digital inversion** for Poly IV (`engine/poly_iv.py`):
+- Above/below: solve `N(d2) = YES_price` for σ via `brentq`
+- Range: solve `N(d2_lo) − N(d2_hi) = YES_price` for σ via `brentq`
 
-### Strategy 2 — Skew Arb
+**Three arbitrage strategies** (`engine/arb_scanner.py`):
 
-```
-Condition: OTM put (strike < spot × 0.97)
-           derive_prob_below > poly_prob_below
-           AND (derive_prob_below − poly_prob_below) > 3%
+| Strategy | Condition | Action |
+|---|---|---|
+| **Short Vol** | `synth < derive < poly` AND edge > 3% | BUY POLY NO |
+| **Skew Arb** | OTM put: `derive_below >> poly_below` AND edge > 3% | SELL PUT SPREAD |
+| **The Pin** | Range market: `derive_range > poly_range` AND edge > 3% | BUY POLY YES |
 
-Action:    SELL PUT SPREAD / BUY POLY NO
-```
+Kelly fraction, BSM delta, and vega computed per signal.
 
-The options market prices more downside risk (negative skew) than the prediction market. Sell the over-priced put spread or buy the cheap Poly NO.
+### Clients (`clients/`)
 
-### Strategy 3 — The Pin
+| Client | Source | Notes |
+|---|---|---|
+| `binance.py` | Binance public REST | Spot price |
+| `derive.py` | Lyra Finance public API | Full options chain, per-expiry batch fetch with bid/ask |
+| `polymarket.py` | Gamma REST API | Settlement window query (±1h around 17:00 UTC) — guarantees all daily strikes, not just high-volume ones |
+| `polymarket_clob.py` | Polymarket CLOB WebSocket | Batched subscriptions (50 token IDs/batch), exponential backoff reconnect |
+| `poly_clob_rest.py` | py-clob-client SDK | Order book depth (top-10 levels), batch midpoints — read-only, no auth |
+| `synthdata.py` | SynthData API | All 6 endpoints with 10min–2h TTL cache; serialised calls (1s gap) to avoid burst 429s |
 
-```
-Condition: Range market [K₁, K₂] where spot is inside or near the range
-           derive_range_prob > poly_range_prob
-           AND (derive_range_prob − poly_range_prob) > 3%
+### SynthData API Usage
 
-Action:    BUY POLY YES (range)
-```
+All six endpoints are used:
 
-Options pricing (via a call or put spread spanning the range) implies higher probability of the price finishing inside the range than Polymarket prices. Buy the cheap Poly range YES.
+| Endpoint | Used for | Cache TTL |
+|---|---|---|
+| `/prediction-percentiles` | Synth probability curve, IQR-implied vol | 10 min |
+| `/insights/volatility` | Forecast vol, realized vol, vol regime (expanding / compressing / stable) | 30 min |
+| `/insights/lp-bounds` | Risk layer | 2 h |
+| `/insights/lp-probabilities` | Direct P(S>K) probabilities | 60 min |
+| `/insights/liquidation` | Leverage safety table | 2 h |
+| `/insights/polymarket/up-down/daily` | SynthData vs Polymarket up/down edge | 10 min |
 
-All three strategies use a configurable `EDGE_THRESHOLD = 3%` and skip markets with strikes more than 20% from spot (near-certain outcomes are not real arbitrage).
-
----
-
-## Live CLOB WebSocket
-
-Polymarket's Gamma REST API refreshes every 60s. The CLOB WebSocket gives live bid/ask at sub-second latency.
-
-```
-URL:  wss://ws-subscriptions-clob.polymarket.com/ws/market
-
-Subscribe:
-  {"type": "market", "assets_ids": ["token_id_1", ...], "custom_feature_enabled": true}
-
-Events:
-  book         — full order book snapshot on subscribe (bids[] / asks[])
-  price_change — incremental update, carries best_bid/best_ask directly
-  best_bid_ask — fired on any spread change (custom_feature_enabled=true)
-```
-
-The client (`clients/polymarket_clob.py`) subscribes in batches of 50 token IDs and reconnects with exponential backoff (5s → 10s → 20s → 60s max). The frontend polls `/api/poly/live/{asset}` every 5s and overlays the live mid prices on the probability chart. A pulsing green **●** in the Polymarket legend indicates the WebSocket is live.
-
----
-
-## API Reference
+### API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Status, mode, `synth_enabled` flag |
+| `GET` | `/health` | Status, mode, SynthData credits remaining |
 | `GET` | `/api/snapshot/{asset}` | Full triangulation snapshot (BTC or ETH) |
-| `GET` | `/api/signals` | All active signals, sorted by edge descending |
-| `GET` | `/api/mock/{asset}` | Demo snapshot — always works, no keys needed |
+| `GET` | `/api/vol_surface/{asset}` | Per-expiry IV smile + Poly IV points + divergence alerts |
+| `GET` | `/api/options_chain/{asset}` | Multi-expiry Derive bid/ask + SynthData + matched Poly markets |
+| `GET` | `/api/signals` | All active signals sorted by edge |
+| `GET` | `/api/signals/history` | Historical signals with P&L |
+| `GET` | `/api/signals/pnl` | P&L summary by strategy |
+| `GET` | `/api/risk/{asset}` | Full SynthData risk dataset (vol regime, lp-bounds, liq table) |
 | `GET` | `/api/poly/live/{asset}` | Live CLOB prices `{token_id: {bid, ask, mid}}` |
+| `GET` | `/api/poly/orderbook/{token_id}` | Full order book depth via py-clob-client REST |
+| `GET` | `/api/poly/midpoints/{asset}` | Batch REST midpoints for all asset tokens |
+| `GET` | `/api/mock/{asset}` | Demo snapshot — always works, no keys needed |
 | `GET` | `/api/stream` | SSE: 30s push of spot + signal count |
 
-### Snapshot response shape
+---
 
-```json
-{
-  "asset": "BTC",
-  "spot": 69453.29,
-  "mode": "live",
-  "derive_curve":  {"68000": 0.71, "69000": 0.53, ...},
-  "synth_curve":   {"68000": 0.68, "69000": 0.50, ...},
-  "poly_points":   [{"strike": 70000, "yes_price": 0.38, "clob_token_id": "...", ...}],
-  "signals":       [{"strategy": "short_vol", "edge_pct": 0.11, ...}],
-  "strike_table":  [{"strike": 69000, "synth_prob": 0.50, "derive_prob": 0.53, ...}]
-}
+## Stack
+
+| Layer | Tech |
+|---|---|
+| Backend | Python 3.12, FastAPI, uvicorn, aiohttp |
+| Math | scipy (BSM inversion, `norm.cdf`, `brentq`), numpy, `scipy.interpolate.PchipInterpolator` |
+| Poly SDK | py-clob-client (read-only order book depth, batch midpoints) |
+| Frontend | React 18, TypeScript, Vite, Tailwind CSS, Recharts |
+| Storage | SQLite via `engine/signal_tracker.py` (signal history + P&L settlement) |
+| Data sources | SynthData API · Derive/Lyra Finance · Polymarket Gamma + CLOB · Binance |
+
+---
+
+## Repository Structure
+
+```
+api/
+  main.py              FastAPI app — all endpoints, snapshot cache, background refresh loop
+clients/
+  binance.py           Binance spot price
+  derive.py            Derive/Lyra options chain (full bid/ask per strike)
+  polymarket.py        Polymarket Gamma REST (market discovery, settlement window query)
+  polymarket_clob.py   Polymarket CLOB WebSocket (live prices, batched subscriptions)
+  poly_clob_rest.py    py-clob-client REST (order book depth, batch midpoints)
+  synthdata.py         SynthData API (all 6 endpoints, TTL cache, serialised calls)
+engine/
+  prob_calc.py         DVM curve builder, variance interpolation, TTE utilities
+  synth_mapper.py      SynthData CDF → probability curve + IQR-implied vol
+  arb_scanner.py       Three-strategy arbitrage scanner + Kelly/Greeks per signal
+  poly_iv.py           BSM digital option inversion (Polymarket → implied vol)
+  greeks.py            BSM delta, vega, binary delta
+  signal_tracker.py    SQLite signal history + P&L settlement resolver
+ui/src/
+  App.tsx              Top-level routing (Dashboard / Vol Surface / Options Chain / History)
+  components/
+    Dashboard.tsx      Prob chart + signals + strike table + Poly markets panel
+    VolSurface.tsx     IV comparison charts + Markets table with order book depth
+    OptionsChain.tsx   Multi-expiry Derive bid/ask vs SynthData vs Polymarket
+    ProbChart.tsx      Recharts probability curves + live CLOB dots
+    SignalCard.tsx     Signal display with Greeks and Kelly fraction
+    StrikeTable.tsx    Per-strike edge table
+    SignalHistory.tsx  Historical signals + P&L
+data/mock/             Pre-computed snapshots for demo mode (no API keys needed)
 ```
 
 ---
 
-## Data Sources
+## Key Design Decisions
 
-| Source | Endpoint | Auth |
-|---|---|---|
-| **Binance** | `GET /api/v3/ticker/price` | None (public) |
-| **Derive / Lyra Finance** | `public/get_instruments` + `public/get_ticker` | None (public) |
-| **Polymarket Gamma API** | `GET /markets?volume_num_min=50` | None (public) |
-| **Polymarket CLOB WS** | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | None (public) |
-| **SynthData AI** | `POST /prediction-percentiles` | `SYNTHDATA_API_KEY` |
+**Why DVM instead of Breeden-Litzenberger?** BL requires a dense, smooth options chain. 0DTE Derive chains are sparse — DVM finite-differencing between adjacent mid prices is numerically stable and produces no negative probabilities.
 
----
+**Why variance interpolation for TTE alignment?** Derive expires 08:00 UTC, Poly settles 17:00 UTC. Linear IV interpolation would misprice the time dimension. σ²×T interpolation correctly handles the square-root-of-time scaling.
 
-## Requirements
+**Why settlement window query for Polymarket?** Sorting markets by volume returns this week's multi-day markets ("Will BTC reach $150k in March?"). Querying by `end_date_min/max` (±1h around 17:00 UTC) guarantees all daily strikes — including low-volume ones that are often the most mispriced.
 
-**Python 3.10+**
+**Why serialise SynthData calls?** 6 parallel asyncio.gather requests causes burst 429s. 1s gaps between calls plus per-endpoint backoff keeps credit burn predictable (~500 credits/day across both assets).
 
-```
-fastapi>=0.111.0
-uvicorn[standard]>=0.29.0
-aiohttp>=3.9.0
-numpy>=1.26.0
-scipy>=1.13.0
-python-dotenv>=1.0.0
-```
-
-**Node 18+**
-
-```
-react 18, recharts 2, tailwindcss 3, vite 5, typescript 5
-```
-
-Install everything:
-
-```bash
-pip install -r requirements.txt
-cd ui && npm install
-```
+**Why (D−1) for Poly/Derive expiry matching?** Derive expires 08:00 UTC on date D, Polymarket settles 17:00 UTC on D−1. The closest Poly settlement before any given Derive expiry is always the previous day's 17:00 UTC.
 
 ---
 
@@ -286,36 +239,5 @@ cd ui && npm install
 
 | Variable | Default | Description |
 |---|---|---|
-| `SYNTHDATA_API_KEY` | — | Required for live AI curve (get one at synthdata.co) |
-| `MOCK_MODE` | `0` | Set to `1` to serve pre-computed demo data |
-
-The backend logs clearly indicate which mode is active:
-```
-Mode: LIVE (real API data)     ← all three sources
-Mode: PARTIAL                  ← Binance + Derive working, no SynthData key
-Mode: DEMO                     ← MOCK_MODE=1
-```
-
----
-
-## UI Overview
-
-The dashboard has three main sections:
-
-**Probability Curves Chart** — three overlaid curves showing `P(S_T > K)` at the Polymarket 17:00 UTC settlement horizon:
-- Blue line — SynthData AI (PchipInterpolator on percentile data)
-- Orange line — Derive DVM (call/put spreads)
-- Green dots — Polymarket (live CLOB mid when WebSocket is connected, snapshot otherwise)
-
-**Arbitrage Signal Cards** — one card per detected signal, showing strategy type, strike, edge %, all three probability estimates, and a confidence badge (HIGH / MEDIUM / LOW based on edge size).
-
-**Strike-by-Strike Table** — every strike in the grid with all three probabilities side by side, edge highlighted in yellow for actionable rows.
-
----
-
-## Project Structure Notes
-
-- `config.py` has no parent dependencies — safe to import anywhere
-- All `clients/` are standalone and can be used independently
-- `engine/prob_calc.py` exports `build_derive_prob_curve` and `compute_poly_settlement_tte` — the two functions everything else depends on
-- The frontend proxies `/api/*` to `localhost:8000` via Vite's `server.proxy` config
+| `SYNTHDATA_API_KEY` | — | Required for live mode (get one at synthdata.co) |
+| `MOCK_MODE` | `0` | Set to `1` to serve pre-computed demo data without any API keys |
