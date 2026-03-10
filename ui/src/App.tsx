@@ -2,11 +2,12 @@ import { useState, useEffect, useCallback } from 'react'
 import Dashboard from './components/Dashboard'
 import SignalHistory from './components/SignalHistory'
 import VolSurface from './components/VolSurface'
+import OptionsChain from './components/OptionsChain'
 import { Snapshot } from './types'
 
 const ASSETS = ['BTC', 'ETH'] as const
 type Asset = typeof ASSETS[number]
-type View = 'dashboard' | 'vol_surface' | 'history'
+type View = 'dashboard' | 'vol_surface' | 'options' | 'history'
 
 interface LivePolyPrice { bid: number; ask: number; mid: number }
 
@@ -104,7 +105,7 @@ function App() {
                       : 'text-slate-500 hover:text-slate-300'
                   }`}
                 >
-                  {v === 'dashboard' ? 'Dashboard' : v === 'vol_surface' ? 'Vol Surface' : 'History'}
+                  {v === 'dashboard' ? 'Dashboard' : v === 'vol_surface' ? 'Vol Surface' : v === 'options' ? 'Options Chain' : 'History'}
                 </button>
               ))}
             </nav>
@@ -179,6 +180,8 @@ function App() {
       <main className="max-w-7xl mx-auto px-4 pb-12">
         {view === 'history' ? (
           <SignalHistory />
+        ) : view === 'options' ? (
+          <OptionsChain asset={asset} />
         ) : view === 'vol_surface' ? (
           <VolSurface asset={asset} />
         ) : loading && !currentSnapshot ? (

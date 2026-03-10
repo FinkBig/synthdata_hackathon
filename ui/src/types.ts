@@ -114,11 +114,51 @@ export interface PolyPoint {
   yes_price: number
   yes_bid: number
   yes_ask: number
+  no_bid?: number
+  no_ask?: number
   question: string
   volume_24h: number
   clob_token_id?: string
   polymarket_url?: string
   expiry?: string
+}
+
+export interface OptionsChainRow {
+  strike: number
+  moneyness_pct: number
+  call_bid: number | null
+  call_ask: number | null
+  call_iv: number | null
+  put_bid: number | null
+  put_ask: number | null
+  put_iv: number | null
+  synth_prob: number | null
+  derive_prob: number | null
+  derive_binary: number | null
+  poly_yes_price: number | null
+  poly_yes_bid: number | null
+  poly_yes_ask: number | null
+  poly_question: string | null
+  poly_url: string | null
+  poly_strike: number | null
+  edge_vs_synth: number | null
+  edge_vs_derive: number | null
+  action: string | null
+}
+
+export interface OptionsChainExpiry {
+  expiry: string
+  tte_hours: number
+  label: string
+  poly_settle: string
+  poly_settle_label: string
+  rows: OptionsChainRow[]
+}
+
+export interface OptionsChainData {
+  asset: string
+  spot: number
+  expiries: OptionsChainExpiry[]
 }
 
 export interface StrikeRow {

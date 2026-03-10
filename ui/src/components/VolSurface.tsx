@@ -18,6 +18,7 @@ const EXPIRY_COLOURS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#06b6d4', '
 type TopTab = 'visualizations' | 'markets'
 type ChartView = 'iv_compare' | 'smile' | 'term'
 type SortKey = 'moneyness_pct' | 'poly_iv' | 'derive_iv' | 'iv_gap_pts' | 'yes_price' | 'volume_24h'
+type MarketSubTab = 'above_below' | 'daily_range'
 
 // ── Data helpers ──────────────────────────────────────────────────────────────
 
@@ -382,20 +383,22 @@ function VisualizationsTab({ data }: { data: VolSurfaceData }) {
 
 function MarketsTab({ data }: { data: VolSurfaceData }) {
   const [search, setSearch] = useState('')
-  const [typeFilter, setTypeFilter] = useState<'all' | 'above_below' | 'daily_range'>('all')
+  const [marketSubTab, setMarketSubTab] = useState<MarketSubTab>('above_below')
   const [gapFilter, setGapFilter] = useState<'all' | '5' | '10' | '15'>('all')
   const [sortKey, setSortKey] = useState<SortKey>('iv_gap_pts')
   const [sortAsc, setSortAsc] = useState(false)
 
   const polyPoints = data.poly_iv_points ?? []
 
+  const aboveBelow = polyPoints.filter(p => p.market_type === 'above_below')
+  const ranges = polyPoints.filter(p => p.market_type === 'daily_range')
+
   const filtered = useMemo(() => {
-    let rows = polyPoints
+    let rows = marketSubTab === 'above_below' ? aboveBelow : ranges
     if (search) {
       const q = search.toLowerCase()
       rows = rows.filter(p => (p.question ?? '').toLowerCase().includes(q) || String(p.strike).includes(q))
     }
-    if (typeFilter !== 'all') rows = rows.filter(p => p.market_type === typeFilter)
     if (gapFilter !== 'all') {
       const threshold = Number(gapFilter)
       rows = rows.filter(p => p.iv_gap_pts != null && Math.abs(p.iv_gap_pts) >= threshold)
@@ -406,7 +409,7 @@ function MarketsTab({ data }: { data: VolSurfaceData }) {
       const diff = (av as number) - (bv as number)
       return sortAsc ? diff : -diff
     })
-  }, [polyPoints, search, typeFilter, gapFilter, sortKey, sortAsc])
+  }, [polyPoints, search, marketSubTab, gapFilter, sortKey, sortAsc, aboveBelow, ranges])
 
   function toggleSort(key: SortKey) {
     if (sortKey === key) setSortAsc(p => !p)
@@ -432,6 +435,18 @@ function MarketsTab({ data }: { data: VolSurfaceData }) {
 
   return (
     <div className="space-y-4">
+      {/* Market type sub-tabs */}
+      <div className="flex items-center gap-2 border-b border-slate-800 pb-3">
+        <button onClick={() => setMarketSubTab('above_below')}
+          className={`text-sm px-4 py-1.5 rounded-lg font-medium transition-colors ${marketSubTab === 'above_below' ? 'bg-blue-600/30 text-blue-300 border border-blue-500/30' : 'text-slate-500 hover:text-slate-300'}`}>
+          Above / Below <span className="ml-1 text-xs opacity-70">({aboveBelow.length})</span>
+        </button>
+        <button onClick={() => setMarketSubTab('daily_range')}
+          className={`text-sm px-4 py-1.5 rounded-lg font-medium transition-colors ${marketSubTab === 'daily_range' ? 'bg-violet-600/30 text-violet-300 border border-violet-500/30' : 'text-slate-500 hover:text-slate-300'}`}>
+          Range <span className="ml-1 text-xs opacity-70">({ranges.length})</span>
+        </button>
+      </div>
+
       {/* Search + filters */}
       <div className="flex flex-wrap items-center gap-3">
         <input
@@ -441,11 +456,6 @@ function MarketsTab({ data }: { data: VolSurfaceData }) {
           onChange={e => setSearch(e.target.value)}
           className="flex-1 min-w-48 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-slate-500"
         />
-        <div className="flex gap-1">
-          <Pill active={typeFilter === 'all'} onClick={() => setTypeFilter('all')}>All types</Pill>
-          <Pill active={typeFilter === 'above_below'} onClick={() => setTypeFilter('above_below')}>Above/Below</Pill>
-          <Pill active={typeFilter === 'daily_range'} onClick={() => setTypeFilter('daily_range')}>Range</Pill>
-        </div>
         <div className="flex gap-1">
           <Pill active={gapFilter === 'all'} onClick={() => setGapFilter('all')}>All gaps</Pill>
           <Pill active={gapFilter === '5'} onClick={() => setGapFilter('5')}>&gt;5 pts</Pill>

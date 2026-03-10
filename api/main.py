@@ -238,6 +238,8 @@ async def _fetch_live_snapshot(asset: str) -> Dict:
             "yes_price": mid,
             "yes_bid": m.yes_bid,
             "yes_ask": m.yes_ask,
+            "no_bid": m.no_bid,
+            "no_ask": m.no_ask,
             "question": m.question,
             "volume_24h": m.volume_24h,
             "clob_token_id": m.clob_token_id,
@@ -524,6 +526,20 @@ def _bsm_digital_above(spot: float, strike: float, sigma: float, tte: float) -> 
         from scipy.stats import norm
         d2 = (math.log(spot / strike) - 0.5 * sigma ** 2 * tte) / (sigma * math.sqrt(tte))
         return float(norm.cdf(d2))
+    except Exception:
+        return None
+
+
+def _nearest_curve_value(curve: Dict, strike: float) -> Optional[float]:
+    """Look up probability in a strike→prob dict at the nearest strike (<2.5% tolerance)."""
+    if not curve:
+        return None
+    try:
+        best_key = min(curve.keys(), key=lambda k: abs(float(k) - strike))
+        if abs(float(best_key) - strike) / max(strike, 1) > 0.025:
+            return None
+        v = curve[best_key]
+        return float(v) if v is not None else None
     except Exception:
         return None
 
@@ -863,6 +879,218 @@ def _mock_risk_data(asset: str) -> Dict:
         "synth_poly_edge": 0.16,
         "credits_remaining": 18983,
     }
+
+
+@app.get("/api/options_chain/{asset}")
+async def options_chain_endpoint(asset: str):
+    """Multi-expiry options chain: Derive bid/ask + SynthData prob + matched Poly markets.
+
+    For each Derive expiry date D, the matching Polymarket settlement is (D−1) at 17:00 UTC —
+    because Derive expires 08:00 UTC while Poly settles the evening before.
+    """
+    asset = asset.upper()
+    if asset not in ASSETS:
+        return JSONResponse({"error": f"Unknown asset: {asset}"}, status_code=400)
+
+    if MOCK_MODE:
+        return _mock_options_chain(asset)
+
+    chain = await derive_client.get_options_chain(asset)
+    spot = await binance_client.get_spot_price(asset)
+    if not spot or spot <= 0:
+        spot = derive_client.get_spot_from_chain(chain)
+    if not chain or spot <= 0:
+        return {"asset": asset, "spot": 0, "expiries": []}
+
+    from collections import defaultdict
+    from datetime import timedelta
+    now_ts = datetime.now(timezone.utc).timestamp()
+    now_dt = datetime.now(timezone.utc)
+
+    # Group options by expiry
+    by_expiry: Dict[Any, List] = defaultdict(list)
+    for opt in chain:
+        if opt.expiry.timestamp() > now_ts:
+            by_expiry[opt.expiry].append(opt)
+
+    if not by_expiry:
+        return {"asset": asset, "spot": spot, "expiries": []}
+
+    expiry_list = sorted(by_expiry.keys())
+
+    # For each Derive expiry D, the corresponding Poly settlement is (D−1) at 17:00 UTC.
+    # For very near-term expiries where that day has already passed, fall forward to
+    # the next available 17:00 UTC.
+    def _poly_settle_for_expiry(exp: datetime) -> datetime:
+        candidate = exp.replace(hour=17, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        if candidate.timestamp() < now_ts:
+            # Use today or tomorrow's 17:00 UTC
+            today17 = now_dt.replace(hour=17, minute=0, second=0, microsecond=0)
+            return today17 if today17.timestamp() > now_ts else today17 + timedelta(days=1)
+        return candidate
+
+    poly_settle_dts = [_poly_settle_for_expiry(exp) for exp in expiry_list]
+
+    # Fetch Poly markets for each unique settlement date in parallel
+    unique_settles = list(dict.fromkeys(poly_settle_dts))  # deduplicated, order-preserving
+    poly_results = await asyncio.gather(
+        *(poly_client.get_daily_markets(settle, asset) for settle in unique_settles),
+        return_exceptions=True,
+    )
+    settle_to_markets: Dict[datetime, List] = {}
+    for settle, result in zip(unique_settles, poly_results):
+        settle_to_markets[settle] = [] if isinstance(result, Exception) else (result or [])
+
+    # Pull SynthData / Derive probability curves from snapshot cache
+    cached_snap = _snapshots.get(asset, {})
+    synth_curve_raw = cached_snap.get("synth_curve", {})
+    derive_curve_raw = cached_snap.get("derive_curve", {})
+
+    expiry_blocks = []
+    for exp, settle_dt in zip(expiry_list, poly_settle_dts):
+        opts = by_expiry[exp]
+        tte_hours = (exp.timestamp() - now_ts) / 3600.0
+        tte_years = tte_hours / 8760.0
+
+        calls = {opt.strike: opt for opt in opts if opt.option_type == "call"}
+        puts = {opt.strike: opt for opt in opts if opt.option_type == "put"}
+        all_strikes = sorted(set(list(calls) + list(puts)))
+        all_strikes = [k for k in all_strikes if 0.80 <= k / spot <= 1.20]
+
+        poly_markets_exp = settle_to_markets.get(settle_dt, [])
+        poly_above: Dict[float, Any] = {}
+        for m in poly_markets_exp:
+            if m.market_type == "above_below" and m.strike and m.is_above:
+                poly_above[m.strike] = m
+
+        tolerance = 500 if asset == "BTC" else 50
+
+        rows = []
+        for strike in all_strikes:
+            call = calls.get(strike)
+            put = puts.get(strike)
+            moneyness_pct = round((strike / spot - 1) * 100, 1)
+
+            synth_prob = _nearest_curve_value(synth_curve_raw, strike)
+            derive_prob = _nearest_curve_value(derive_curve_raw, strike)
+
+            # Pick best IV for this strike: call for OTM calls, put for OTM puts
+            call_iv = None
+            if call and call.implied_volatility > 0:
+                iv = call.implied_volatility
+                call_iv = round(iv / 100.0 if iv > 5 else iv, 4)
+            put_iv = None
+            if put and put.implied_volatility > 0:
+                iv = put.implied_volatility
+                put_iv = round(iv / 100.0 if iv > 5 else iv, 4)
+
+            best_iv = call_iv if moneyness_pct >= 0 else (put_iv or call_iv)
+            derive_binary = _bsm_digital_above(spot, strike, best_iv, tte_years) if best_iv else None
+
+            # Match Poly by nearest strike within tolerance
+            poly_m = poly_above.get(strike)
+            if not poly_m and poly_above:
+                closest = min(poly_above.keys(), key=lambda k: abs(k - strike))
+                if abs(closest - strike) <= tolerance:
+                    poly_m = poly_above[closest]
+
+            poly_mid = None
+            if poly_m:
+                poly_mid = round(
+                    (poly_m.yes_bid + poly_m.yes_ask) / 2 if poly_m.yes_ask > 0 else poly_m.yes_price, 4
+                )
+
+            # Primary edge: Poly vs SynthData (crowd vs AI forecast)
+            edge_vs_synth = round(poly_mid - synth_prob, 4) if (poly_mid is not None and synth_prob is not None) else None
+            # Secondary: Poly vs Derive binary (crowd vs options market)
+            edge_vs_derive = round(poly_mid - derive_binary, 4) if (poly_mid is not None and derive_binary is not None) else None
+
+            action = None
+            if edge_vs_synth is not None:
+                if edge_vs_synth > 0.04:
+                    action = "BUY NO"
+                elif edge_vs_synth < -0.04:
+                    action = "BUY YES"
+
+            rows.append({
+                "strike": strike,
+                "moneyness_pct": moneyness_pct,
+                "call_bid": round(call.bid, 4) if call and call.bid > 0 else None,
+                "call_ask": round(call.ask, 4) if call and call.ask > 0 else None,
+                "call_iv": call_iv,
+                "put_bid": round(put.bid, 4) if put and put.bid > 0 else None,
+                "put_ask": round(put.ask, 4) if put and put.ask > 0 else None,
+                "put_iv": put_iv,
+                "synth_prob": round(synth_prob, 4) if synth_prob is not None else None,
+                "derive_prob": round(derive_prob, 4) if derive_prob is not None else None,
+                "derive_binary": round(derive_binary, 4) if derive_binary is not None else None,
+                "poly_yes_price": poly_mid,
+                "poly_yes_bid": round(poly_m.yes_bid, 4) if poly_m else None,
+                "poly_yes_ask": round(poly_m.yes_ask, 4) if poly_m else None,
+                "poly_question": poly_m.question if poly_m else None,
+                "poly_url": poly_m.polymarket_url if poly_m else None,
+                "poly_strike": poly_m.strike if poly_m else None,
+                "edge_vs_synth": edge_vs_synth,
+                "edge_vs_derive": edge_vs_derive,
+                "action": action,
+            })
+
+        expiry_blocks.append({
+            "expiry": exp.isoformat(),
+            "tte_hours": round(tte_hours, 2),
+            "label": f"{exp.strftime('%b %d')} ({tte_hours:.0f}h)",
+            "poly_settle": settle_dt.isoformat(),
+            "poly_settle_label": settle_dt.strftime("%b %d %H:%M UTC"),
+            "rows": rows,
+        })
+
+    return {"asset": asset, "spot": spot, "expiries": expiry_blocks}
+
+
+def _mock_options_chain(asset: str) -> Dict:
+    """Realistic mock options chain for demo mode."""
+    from datetime import timedelta
+    spot = 95_200 if asset == "BTC" else 3_420
+    now = datetime.now(timezone.utc)
+    expiry_blocks = []
+    for days_ahead, tte_h in [(1, 8), (4, 80), (11, 200)]:
+        exp_dt = (now + timedelta(days=days_ahead)).replace(hour=8, minute=0, second=0, microsecond=0)
+        settle_dt = exp_dt.replace(hour=17) - timedelta(days=1)
+        strikes = [round(spot * m / 100) for m in range(88, 113, 2)]
+        rows = []
+        for k in strikes:
+            mono = round((k / spot - 1) * 100, 1)
+            iv = round(0.60 + abs(mono) * 0.003 + (0.005 if mono < 0 else 0), 4)
+            synth = round(max(0.02, min(0.98, 0.5 - mono * 0.008)), 4)
+            d_bin = round(max(0.02, min(0.98, 0.5 - mono * 0.0085)), 4)
+            poly = round(max(0.02, min(0.98, 0.5 - mono * 0.009 + 0.01)), 4) if abs(mono) <= 8 else None
+            edge = round(poly - synth, 4) if poly is not None else None
+            rows.append({
+                "strike": k, "moneyness_pct": mono,
+                "call_bid": round(max(0.005, spot * max(0, -mono / 100) + 0.005), 4),
+                "call_ask": round(max(0.008, spot * max(0, -mono / 100) + 0.012), 4),
+                "call_iv": iv,
+                "put_bid": round(max(0.005, spot * max(0, mono / 100) + 0.003), 4),
+                "put_ask": round(max(0.008, spot * max(0, mono / 100) + 0.010), 4),
+                "put_iv": round(iv + 0.015, 4),
+                "synth_prob": synth, "derive_prob": d_bin, "derive_binary": d_bin,
+                "poly_yes_price": poly,
+                "poly_yes_bid": round(poly - 0.015, 4) if poly else None,
+                "poly_yes_ask": round(poly + 0.015, 4) if poly else None,
+                "poly_question": f"Will {asset} be above ${k:,} by {settle_dt.strftime('%b %d')}?" if poly else None,
+                "poly_url": None, "poly_strike": k if poly else None,
+                "edge_vs_synth": edge,
+                "edge_vs_derive": round(poly - d_bin, 4) if poly else None,
+                "action": ("BUY NO" if edge and edge > 0.04 else "BUY YES" if edge and edge < -0.04 else None),
+            })
+        expiry_blocks.append({
+            "expiry": exp_dt.isoformat(), "tte_hours": float(tte_h),
+            "label": f"{exp_dt.strftime('%b %d')} ({tte_h}h)",
+            "poly_settle": settle_dt.isoformat(),
+            "poly_settle_label": settle_dt.strftime("%b %d %H:%M UTC"),
+            "rows": rows,
+        })
+    return {"asset": asset, "spot": spot, "expiries": expiry_blocks}
 
 
 @app.get("/api/stream")

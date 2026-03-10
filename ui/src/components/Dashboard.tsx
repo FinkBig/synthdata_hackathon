@@ -1,4 +1,4 @@
-import { Snapshot } from '../types'
+import { Snapshot, PolyPoint } from '../types'
 import ProbChart from './ProbChart'
 import SignalCard from './SignalCard'
 import StrikeTable from './StrikeTable'
@@ -73,6 +73,11 @@ export default function Dashboard({ snapshot, asset, livePolyPrices = {}, clobCo
         <StrikeTable rows={strike_table} />
       </div>
 
+      {/* Poly Markets */}
+      {snapshot.poly_points?.length > 0 && (
+        <PolyMarketsPanel points={snapshot.poly_points} />
+      )}
+
       {/* Math note */}
       <div className="bg-slate-900/50 border border-slate-800 rounded-lg p-4 text-xs text-slate-500">
         <p className="font-semibold text-slate-400 mb-1">Method: Discrete Vertical Mapping (DVM)</p>
@@ -91,6 +96,101 @@ function StatCard({ label, value, accent }: { label: string; value: string; acce
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
       <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">{label}</p>
       <p className={`text-xl font-bold ${accent ?? 'text-slate-100'}`}>{value}</p>
+    </div>
+  )
+}
+
+function PolyMarketsPanel({ points }: { points: PolyPoint[] }) {
+  const now = Date.now()
+
+  function formatTTE(expiry?: string) {
+    if (!expiry) return '—'
+    const ms = new Date(expiry).getTime() - now
+    if (ms <= 0) return 'expired'
+    const h = ms / 3_600_000
+    if (h < 1) return `${Math.round(h * 60)}m`
+    if (h < 24) return `${h.toFixed(1)}h`
+    return `${(h / 24).toFixed(1)}d`
+  }
+
+  function formatStrike(p: PolyPoint) {
+    if (p.market_type === 'daily_range' && p.lower_bound != null && p.upper_bound != null) {
+      return `$${p.lower_bound.toLocaleString()} – $${p.upper_bound.toLocaleString()}`
+    }
+    return p.strike ? `$${p.strike.toLocaleString()}` : '—'
+  }
+
+  const sorted = [...points].sort((a, b) => {
+    // sort: above_below first, then by strike asc
+    if (a.market_type !== b.market_type) return a.market_type === 'above_below' ? -1 : 1
+    return (a.strike ?? 0) - (b.strike ?? 0)
+  })
+
+  return (
+    <div>
+      <h2 className="text-sm font-semibold text-slate-300 mb-3">
+        Polymarket Prediction Markets
+        <span className="ml-2 text-xs font-normal text-slate-500">{points.length} active markets · today's settlement</span>
+      </h2>
+      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b border-slate-800 bg-slate-800/50 text-slate-400">
+                <th className="px-4 py-2 text-left min-w-60">Market</th>
+                <th className="px-4 py-2 text-left">Type</th>
+                <th className="px-4 py-2 text-right">Strike / Range</th>
+                <th className="px-4 py-2 text-right">TTE</th>
+                <th className="px-4 py-2 text-right text-green-400">YES Bid</th>
+                <th className="px-4 py-2 text-right text-green-400">YES Ask</th>
+                <th className="px-4 py-2 text-right text-red-400">NO Bid</th>
+                <th className="px-4 py-2 text-right text-red-400">NO Ask</th>
+                <th className="px-4 py-2 text-right">Vol 24h</th>
+                <th className="px-4 py-2" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((p, i) => {
+                const yesMid = p.yes_price
+                const noBid = p.no_bid ?? (1 - p.yes_ask)
+                const noAsk = p.no_ask ?? (1 - p.yes_bid)
+                return (
+                  <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/20">
+                    <td className="px-4 py-2.5">
+                      <p className="text-slate-200 leading-tight">{p.question}</p>
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${
+                        p.market_type === 'above_below' ? 'bg-blue-500/20 text-blue-300' : 'bg-violet-500/20 text-violet-300'
+                      }`}>
+                        {p.market_type === 'above_below' ? 'A/B' : 'RANGE'}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2.5 text-right font-mono text-slate-300">{formatStrike(p)}</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-slate-400">{formatTTE(p.expiry)}</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-green-300">{(p.yes_bid * 100).toFixed(1)}¢</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-green-200">{(p.yes_ask * 100).toFixed(1)}¢</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-red-300">{(noBid * 100).toFixed(1)}¢</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-red-200">{(noAsk * 100).toFixed(1)}¢</td>
+                    <td className="px-4 py-2.5 text-right text-slate-500">
+                      {p.volume_24h ? `$${(p.volume_24h / 1000).toFixed(0)}k` : '—'}
+                    </td>
+                    <td className="px-4 py-2.5 text-center">
+                      {p.polymarket_url ? (
+                        <a href={p.polymarket_url} target="_blank" rel="noopener noreferrer"
+                          className="text-slate-600 hover:text-slate-300 transition-colors">↗</a>
+                      ) : '—'}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div className="px-4 py-2 border-t border-slate-800 text-xs text-slate-600">
+          YES mid = CLOB mid · NO bid/ask derived from YES ask/bid · A/B = above/below markets · Poly settles 17:00 UTC
+        </div>
+      </div>
     </div>
   )
 }
