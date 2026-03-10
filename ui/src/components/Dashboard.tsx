@@ -120,7 +120,7 @@ export default function Dashboard({ snapshot, asset, livePolyPrices = {}, clobCo
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {signals.map((signal, i) => (
-              <SignalCard key={i} signal={signal} polyPoints={snapshot.poly_points} />
+              <SignalCard key={i} signal={signal} polyPoints={snapshot.poly_points} spot={snapshot.spot} />
             ))}
           </div>
         </div>
@@ -129,7 +129,7 @@ export default function Dashboard({ snapshot, asset, livePolyPrices = {}, clobCo
       {/* Strike Table */}
       <div>
         <h2 className="text-sm font-semibold text-slate-300 mb-3">Strike-by-Strike Comparison</h2>
-        <StrikeTable rows={strike_table} />
+        <StrikeTable rows={strike_table} spot={snapshot.spot} />
       </div>
 
       {/* Poly Markets */}

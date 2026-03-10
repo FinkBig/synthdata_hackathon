@@ -222,11 +222,35 @@ export default function ProbChart({ snapshot, livePolyPrices = {}, clobConnected
   const [view, setView] = useState<View>('pdf')
 
   const { spot } = snapshot
-  const lo = spot * 0.85
-  const hi = spot * 1.15
 
-  const cdfData = buildCdfData(snapshot, livePolyPrices).filter(d => d.strike >= lo && d.strike <= hi)
-  const pdfData = buildPdfData(snapshot).filter(d => d.strike >= lo && d.strike <= hi)
+  // Build full datasets first, then zoom to the interesting range.
+  // "Interesting" = where at least one source has probability between 3% and 97%
+  // (the S-curve transition zone). This auto-excludes the flat deep-ITM and
+  // deep-OTM tails that make the chart look empty.
+  const allCdfData = buildCdfData(snapshot, livePolyPrices)
+  const allPdfData = buildPdfData(snapshot)
+
+  function inTransitionZone(d: CdfPoint): boolean {
+    const vals = [d.derive, d.synth, d.poly].filter((v): v is number => v != null)
+    if (!vals.length) return false
+    const max = Math.max(...vals)
+    const min = Math.min(...vals)
+    return max > 3 && min < 97
+  }
+
+  const zoneStrikes = allCdfData.filter(inTransitionZone).map(d => d.strike)
+  // Fallback: ±12% of spot if no transition zone found
+  const fallbackLo = spot * 0.88
+  const fallbackHi = spot * 1.12
+  const zoneLo = zoneStrikes.length ? Math.min(...zoneStrikes) : fallbackLo
+  const zoneHi = zoneStrikes.length ? Math.max(...zoneStrikes) : fallbackHi
+  // Add one tick of padding on each side
+  const tick = zoneStrikes.length > 1 ? (zoneStrikes[1] - zoneStrikes[0]) : spot * 0.01
+  const lo = Math.max(zoneLo - tick, spot * 0.7)
+  const hi = Math.min(zoneHi + tick, spot * 1.3)
+
+  const cdfData = allCdfData.filter(d => d.strike >= lo && d.strike <= hi)
+  const pdfData = allPdfData.filter(d => d.strike >= lo && d.strike <= hi)
 
   const hasPdf = (snapshot.synth_pdf && Object.keys(snapshot.synth_pdf).length > 0) ||
                  (snapshot.derive_pdf && Object.keys(snapshot.derive_pdf).length > 0)
@@ -292,7 +316,7 @@ export default function ProbChart({ snapshot, livePolyPrices = {}, clobConnected
               x={spot}
               stroke="#475569"
               strokeDasharray="6 3"
-              label={{ value: 'Spot', position: 'insideTopLeft', fill: '#64748b', fontSize: 10 }}
+              label={{ value: `$${spot.toLocaleString()}`, position: 'insideTopLeft', fill: '#94a3b8', fontSize: 10 }}
             />
 
             {/* SynthData AI — white filled area */}
@@ -365,7 +389,7 @@ export default function ProbChart({ snapshot, livePolyPrices = {}, clobConnected
               x={spot}
               stroke="#475569"
               strokeDasharray="6 3"
-              label={{ value: 'Spot', position: 'insideTopLeft', fill: '#64748b', fontSize: 10 }}
+              label={{ value: `$${spot.toLocaleString()}`, position: 'insideTopLeft', fill: '#94a3b8', fontSize: 10 }}
             />
 
             {/* Synth AI curve — white */}
