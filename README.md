@@ -36,8 +36,9 @@ When three independent markets (AI forecast + options + prediction market) price
 ### Four views
 
 **Dashboard** — Core arb scanner:
+- **Vol Regime bar**: SynthData AI forecast/realized vol ratio → `EXPANDING / COMPRESSING / STABLE` badge, Forecast IV, Realized Vol, Synth→Poly edge — always visible at top
 - Probability curves: SynthData AI (white) vs Derive DVM (orange) vs Polymarket CLOB (blue), live-updated via WebSocket
-- Arbitrage signal cards: confidence badge (HIGH ≥10% / MEDIUM ≥6% / LOW ≥3%), Kelly fraction, BSM delta, vega
+- Arbitrage signal cards: confidence badge (HIGH ≥10% / MEDIUM ≥6% / LOW ≥3%), Kelly fraction, BSM delta, vega, **live order book depth** (top-3 bid/ask levels fetched per signal)
 - Strike-by-strike comparison table (highlighted rows = actionable edge ≥ 3%)
 - Full Polymarket markets panel: question title, strike/range, TTE, YES/NO bid/ask spread, 24h volume
 
@@ -119,6 +120,12 @@ BL requires a dense, smooth surface. 0DTE chains are too sparse — DVM finite-d
 **BSM digital inversion** for Poly IV (`engine/poly_iv.py`):
 - Above/below: solve `N(d2) = YES_price` for σ via `brentq`
 - Range: solve `N(d2_lo) − N(d2_hi) = YES_price` for σ via `brentq`
+- Min-TTE guard: markets expiring in <1 minute are skipped (degenerate BSM)
+
+**Vol Regime** — computed from SynthData `/insights/volatility`:
+- `forecast_vol / realized_vol > 1.5` → **EXPANDING** (higher edge threshold, reduced Kelly)
+- `< 0.7` → **COMPRESSING** (The Pin strategy boosted)
+- otherwise → **STABLE**
 
 **Three arbitrage strategies** (`engine/arb_scanner.py`):
 
@@ -128,7 +135,7 @@ BL requires a dense, smooth surface. 0DTE chains are too sparse — DVM finite-d
 | **Skew Arb** | OTM put: `derive_below >> poly_below` AND edge > 3% | SELL PUT SPREAD |
 | **The Pin** | Range market: `derive_range > poly_range` AND edge > 3% | BUY POLY YES |
 
-Kelly fraction, BSM delta, and vega computed per signal.
+Kelly fraction (binary): `f* = edge / (1 − poly_prob)` for NO bets, `edge / poly_prob` for YES bets, capped at 25%. BSM delta and vega computed per signal.
 
 ### Clients (`clients/`)
 
@@ -209,11 +216,11 @@ engine/
 ui/src/
   App.tsx              Top-level routing (Dashboard / Vol Surface / Options Chain / History)
   components/
-    Dashboard.tsx      Prob chart + signals + strike table + Poly markets panel
+    Dashboard.tsx      Vol regime bar + prob chart + signals + strike table + Poly markets panel
     VolSurface.tsx     IV comparison charts + Markets table with order book depth
     OptionsChain.tsx   Multi-expiry Derive bid/ask vs SynthData vs Polymarket
     ProbChart.tsx      Recharts probability curves + live CLOB dots
-    SignalCard.tsx     Signal display with Greeks and Kelly fraction
+    SignalCard.tsx     Signal display with Greeks, Kelly fraction, live order book depth
     StrikeTable.tsx    Per-strike edge table
     SignalHistory.tsx  Historical signals + P&L
 data/mock/             Pre-computed snapshots for demo mode (no API keys needed)
@@ -232,6 +239,8 @@ data/mock/             Pre-computed snapshots for demo mode (no API keys needed)
 **Why serialise SynthData calls?** 6 parallel asyncio.gather requests causes burst 429s. 1s gaps between calls plus per-endpoint backoff keeps credit burn predictable (~500 credits/day across both assets).
 
 **Why (D−1) for Poly/Derive expiry matching?** Derive expires 08:00 UTC on date D, Polymarket settles 17:00 UTC on D−1. The closest Poly settlement before any given Derive expiry is always the previous day's 17:00 UTC.
+
+**Why Kelly denominator = `1 − poly_prob` for BUY NO?** When buying NO at price `(1 − poly_prob)`, the Kelly formula for a binary bet is `edge / cost = (poly_prob − synth_prob) / (1 − poly_prob)`. Using `poly_prob` in the denominator would systematically oversize positions at high-probability strikes.
 
 ---
 

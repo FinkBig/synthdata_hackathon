@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
-import { Signal } from '../types'
+import { Signal, PolyPoint, OrderBook } from '../types'
 
 interface Props {
   signal: Signal
+  polyPoints?: PolyPoint[]
 }
 
 const STRATEGY_LABELS: Record<string, string> = {
@@ -50,7 +51,7 @@ function formatCountdown(isoExpiry: string, now: number): string {
   return `${m}m ${s}s`
 }
 
-export default function SignalCard({ signal }: Props) {
+export default function SignalCard({ signal, polyPoints = [] }: Props) {
   const now = useNow()
   const edgePct = (signal.edge_pct * 100).toFixed(1)
   const borderColor = STRATEGY_COLORS[signal.strategy] ?? 'border-l-slate-500'
@@ -60,6 +61,24 @@ export default function SignalCard({ signal }: Props) {
   // Direction badge: green for BUY, red for SELL (as primary action)
   const isBuy = signal.direction.toUpperCase().startsWith('BUY')
   const directionClass = isBuy ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'
+
+  // Find matching Poly market for order book
+  const matchedPoint = polyPoints.find(p =>
+    (p.strike != null && p.strike === signal.strike) ||
+    (p.question === signal.poly_question)
+  )
+  const tokenId = matchedPoint?.clob_token_id
+
+  const [orderBook, setOrderBook] = useState<OrderBook | null>(null)
+  useEffect(() => {
+    if (!tokenId) return
+    let cancelled = false
+    fetch(`/api/poly/orderbook/${tokenId}`)
+      .then(r => r.json())
+      .then(data => { if (!cancelled) setOrderBook(data) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [tokenId])
 
   return (
     <div className={`bg-slate-900 border border-slate-800 border-l-4 ${borderColor} rounded-xl p-4 space-y-3`}>
@@ -147,6 +166,37 @@ export default function SignalCard({ signal }: Props) {
       <div className={`text-xs font-semibold px-3 py-1.5 rounded-lg text-center ${directionClass}`}>
         {signal.direction}
       </div>
+
+      {/* Order book depth (top 3 levels) */}
+      {orderBook && !orderBook.error && (orderBook.bids.length > 0 || orderBook.asks.length > 0) && (
+        <div className="rounded-lg border border-slate-800 overflow-hidden">
+          <div className="grid grid-cols-2 divide-x divide-slate-800">
+            <div>
+              <p className="text-xs text-green-400 text-center py-1 bg-green-400/5 font-medium">Bids</p>
+              {orderBook.bids.slice(0, 3).map((b, i) => (
+                <div key={i} className="flex justify-between px-2 py-0.5 text-xs font-mono">
+                  <span className="text-green-300">{(b.price * 100).toFixed(1)}¢</span>
+                  <span className="text-slate-500">{b.size.toFixed(0)}</span>
+                </div>
+              ))}
+            </div>
+            <div>
+              <p className="text-xs text-red-400 text-center py-1 bg-red-400/5 font-medium">Asks</p>
+              {orderBook.asks.slice(0, 3).map((a, i) => (
+                <div key={i} className="flex justify-between px-2 py-0.5 text-xs font-mono">
+                  <span className="text-red-300">{(a.price * 100).toFixed(1)}¢</span>
+                  <span className="text-slate-500">{a.size.toFixed(0)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          {orderBook.spread != null && (
+            <p className="text-center text-xs text-slate-600 py-0.5 border-t border-slate-800">
+              spread {(orderBook.spread * 100).toFixed(1)}¢ · mid {orderBook.midpoint != null ? (orderBook.midpoint * 100).toFixed(1) + '¢' : '—'}
+            </p>
+          )}
+        </div>
+      )}
 
       {/* Reasoning (truncated) */}
       <p className="text-xs text-slate-500 leading-relaxed line-clamp-3">

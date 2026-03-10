@@ -30,6 +30,7 @@ _MIN_PRICE = 0.03   # below this → too far OTM, no IV signal
 _MAX_PRICE = 0.97   # above this → too far ITM, no IV signal
 _IV_LO     = 0.01   # 1% — lower bound for brentq search
 _IV_HI     = 5.00   # 500% — upper bound for brentq search
+_MIN_TTE   = 1 / 525_600  # 1 minute in years — below this BSM is degenerate
 
 
 @dataclass
@@ -51,7 +52,7 @@ def _iv_above_below(yes_price: float, spot: float, strike: float,
     """Invert a digital call/put price to get implied vol."""
     if not (_MIN_PRICE < yes_price < _MAX_PRICE):
         return None
-    if tte <= 0 or spot <= 0 or strike <= 0:
+    if tte < _MIN_TTE or spot <= 0 or strike <= 0:
         return None
 
     # For "is_above" markets: YES = N(d2)  → target_nd2 = yes_price
@@ -78,7 +79,7 @@ def _iv_range(yes_price: float, spot: float, lower: float, upper: float,
     """Invert a range YES price: P(lower < S < upper) = N(d2_lo) − N(d2_hi)."""
     if not (_MIN_PRICE < yes_price < _MAX_PRICE):
         return None
-    if tte <= 0 or lower <= 0 or upper <= lower:
+    if tte < _MIN_TTE or lower <= 0 or upper <= lower:
         return None
 
     def objective(sigma: float) -> float:

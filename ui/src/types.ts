@@ -206,5 +206,9 @@ export interface Snapshot {
   poly_points: PolyPoint[]
   signals: Signal[]
   strike_table: StrikeRow[]
+  vol_regime?: 'expanding' | 'compressing' | 'stable'
+  forecast_vol?: number | null
+  realized_vol?: number | null
+  synth_poly_edge?: number | null
   error?: string
 }

@@ -15,6 +15,12 @@ interface Props {
 export default function Dashboard({ snapshot, asset, livePolyPrices = {}, clobConnected = false }: Props) {
   const { signals, strike_table } = snapshot
 
+  const regimeColor = snapshot.vol_regime === 'expanding'
+    ? 'bg-red-500/20 text-red-300 border-red-500/30'
+    : snapshot.vol_regime === 'compressing'
+    ? 'bg-blue-500/20 text-blue-300 border-blue-500/30'
+    : 'bg-slate-700/40 text-slate-300 border-slate-600/30'
+
   return (
     <div className="space-y-6">
       {/* Stats row */}
@@ -37,6 +43,59 @@ export default function Dashboard({ snapshot, asset, livePolyPrices = {}, clobCo
           value={snapshot.mode === 'live' ? '3/3' : snapshot.mode === 'partial' ? '2/3' : '3/3 (mock)'}
         />
       </div>
+
+      {/* Vol Regime + SynthData intelligence bar */}
+      {(snapshot.vol_regime || snapshot.forecast_vol != null) && (
+        <div className="flex flex-wrap items-center gap-3 bg-slate-900 border border-slate-800 rounded-xl px-4 py-3">
+          <span className="text-xs text-slate-500 uppercase tracking-wider mr-1">SynthData AI</span>
+
+          {snapshot.vol_regime && (
+            <span className={`text-xs font-semibold px-2.5 py-1 rounded border ${regimeColor}`}>
+              {snapshot.vol_regime.toUpperCase()} VOL
+            </span>
+          )}
+
+          {snapshot.forecast_vol != null && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-slate-500">Forecast IV</span>
+              <span className="text-xs font-mono font-semibold text-slate-200">
+                {(snapshot.forecast_vol * 100).toFixed(1)}%
+              </span>
+            </div>
+          )}
+
+          {snapshot.realized_vol != null && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-slate-500">Realized Vol</span>
+              <span className="text-xs font-mono font-semibold text-slate-200">
+                {(snapshot.realized_vol * 100).toFixed(1)}%
+              </span>
+            </div>
+          )}
+
+          {snapshot.forecast_vol != null && snapshot.realized_vol != null && snapshot.realized_vol > 0 && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-slate-500">Fcast/Rlzd</span>
+              <span className={`text-xs font-mono font-semibold ${
+                (snapshot.forecast_vol / snapshot.realized_vol) > 1.5 ? 'text-red-300'
+                : (snapshot.forecast_vol / snapshot.realized_vol) < 0.7 ? 'text-blue-300'
+                : 'text-slate-300'
+              }`}>
+                {(snapshot.forecast_vol / snapshot.realized_vol).toFixed(2)}×
+              </span>
+            </div>
+          )}
+
+          {snapshot.synth_poly_edge != null && (
+            <div className="flex items-center gap-1.5 ml-auto">
+              <span className="text-xs text-slate-500">Synth→Poly Edge</span>
+              <span className={`text-xs font-mono font-semibold ${snapshot.synth_poly_edge > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {snapshot.synth_poly_edge > 0 ? '+' : ''}{(snapshot.synth_poly_edge * 100).toFixed(1)}%
+              </span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Probability Chart */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
@@ -61,7 +120,7 @@ export default function Dashboard({ snapshot, asset, livePolyPrices = {}, clobCo
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {signals.map((signal, i) => (
-              <SignalCard key={i} signal={signal} />
+              <SignalCard key={i} signal={signal} polyPoints={snapshot.poly_points} />
             ))}
           </div>
         </div>

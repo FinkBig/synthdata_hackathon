@@ -19,6 +19,7 @@ function App() {
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null)
   const [livePolyPrices, setLivePolyPrices] = useState<Record<string, LivePolyPrice>>({})
   const [clobConnected, setClobConnected] = useState(false)
+  const [clobLastUpdate, setClobLastUpdate] = useState<Date | null>(null)
 
   const fetchSnapshot = useCallback(async (a: Asset) => {
     setLoading(true)
@@ -64,8 +65,11 @@ function App() {
         const res = await fetch(`/api/poly/live/${asset}`)
         if (!res.ok) return
         const data = await res.json()
-        setClobConnected(data.connected ?? false)
-        setLivePolyPrices(data.prices ?? {})
+        const connected = data.connected ?? false
+        setClobConnected(connected)
+        const prices = data.prices ?? {}
+        setLivePolyPrices(prices)
+        if (connected && Object.keys(prices).length > 0) setClobLastUpdate(new Date())
       } catch {
         // silently ignore — live prices are best-effort
       }
@@ -95,7 +99,7 @@ function App() {
           <div className="flex items-center gap-3">
             {/* View navigation */}
             <nav className="flex gap-1">
-              {(['dashboard', 'vol_surface', 'history'] as View[]).map(v => (
+              {(['dashboard', 'vol_surface', 'options', 'history'] as View[]).map(v => (
                 <button
                   key={v}
                   onClick={() => setView(v)}
@@ -120,6 +124,21 @@ function App() {
                   : 'bg-orange-500/20 text-orange-400 border border-orange-500/30 animate-pulse'
               }`}>
                 {currentSnapshot.mode === 'live' ? '● LIVE' : currentSnapshot.mode === 'partial' ? '◐ PARTIAL' : '◈ DEMO'}
+              </span>
+            )}
+
+            {/* CLOB staleness indicator */}
+            {clobConnected ? (
+              <span className={`text-xs font-mono px-2 py-1 rounded-full border ${
+                clobLastUpdate && (Date.now() - clobLastUpdate.getTime()) < 30_000
+                  ? 'bg-blue-500/15 text-blue-400 border-blue-500/30'
+                  : 'bg-slate-700/30 text-slate-500 border-slate-700/30'
+              }`} title={clobLastUpdate ? `CLOB last update: ${clobLastUpdate.toLocaleTimeString()}` : 'CLOB connected'}>
+                ⬡ CLOB
+              </span>
+            ) : (
+              <span className="text-xs font-mono px-2 py-1 rounded-full border bg-slate-800/50 text-slate-600 border-slate-700/20" title="Polymarket CLOB not connected">
+                ○ CLOB
               </span>
             )}
 

@@ -97,8 +97,9 @@ def scan_short_vol(
         if not (synth_prob < derive_prob < poly_prob):
             continue
 
-        # Kelly fraction: buying NO at (1-poly_prob), estimated win prob = 1-synth_prob
-        kelly = min((poly_prob - synth_prob) / max(poly_prob, 0.01), 0.25)
+        # Kelly fraction: buying NO at price (1-poly_prob), win prob = 1-synth_prob
+        # denominator = NO price = 1-poly_prob (the cost of the bet, not poly_prob)
+        kelly = min((poly_prob - synth_prob) / max(1 - poly_prob, 0.01), 0.25)
 
         signals.append(Signal(
             strategy="short_vol",
